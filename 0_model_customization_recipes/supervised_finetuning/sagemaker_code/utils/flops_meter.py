@@ -1,32 +1,49 @@
 # sagemaker_code/flops_meter.py
 """
-FLOPs Meter for LLM finetuning according o EU AI act
+FLOPs Meter for LLM fine-tuning — EU AI Act compliance tracking
 
-This module provides comprehensive FLOPs (Floating Point Operations) tracking for ML training:
-1. Analytical FLOPs calculation: F_ft ≈ (4*N_total + 2*N_trainable) * tokens_processed
-2. Hardware-based upper bound via NVML GPU monitoring
-3. Token counting across distributed training
-4. Comparison with pretraining FLOPs
+This module provides comprehensive FLOPs (Floating Point Operations) tracking
+for ML training on Amazon SageMaker AI training jobs:
 
-Output: flops_meter.json with metrics uploaded to S3 and stored in DynamoDB
+1. Analytical FLOPs calculation using an enhanced formula that accounts for
+   parameter-efficient fine-tuning methods such as LoRA (Low-Rank Adaptation)
+   and Spectrum: F_ft = (4*N_total + 2*N_trainable) * tokens_processed
+2. Hardware-based upper bound via NVML (NVIDIA Management Library) GPU monitoring
+3. Token counting across distributed training with GPAI (General-Purpose AI)
+   threshold comparison per EU AI Act guidelines
+4. Comparison with pretraining FLOPs to determine compliance status
 
+Output: flops_meter.json with metrics uploaded to Amazon S3.
 
-See act details:
+Risks and limitations:
+- FLOPs estimates are approximations. The analytical method assumes dense
+  transformer architectures; actual compute for sparse or mixture-of-experts
+  models might differ.
+- The hardware-based upper bound assumes 100% GPU utilization, which overstates
+  actual compute. Use the analytical value (Flops_architecture) as the primary
+  compliance metric.
+- This tool supports compliance tracking but does not constitute legal advice.
+  Consult legal counsel for definitive EU AI Act compliance determinations.
+
+See EU AI Act details:
 https://digital-strategy.ec.europa.eu/en/library/guidelines-scope-obligations-providers-general-purpose-ai-models-under-ai-act
 https://ec.europa.eu/newsroom/dae/redirection/document/118340
 """
 import json
 import os
+import re
 import time
 import threading
 import yaml
 import pynvml
 from dataclasses import dataclass, asdict
 from typing import Optional, Dict, Any
+from urllib.parse import urlparse
 
 import torch
 from torch import distributed as dist
 import boto3
+import botocore.exceptions
 from transformers import (
     TrainerCallback,
     TrainingArguments,
@@ -35,6 +52,21 @@ from transformers import (
 )
 from transformers import Trainer
 from trl import SFTTrainer
+
+# ---------- Path validation ----------
+
+ALLOWED_ROOTS = ("/opt/ml/code", "/opt/ml/output", os.getcwd())
+
+
+def _safe_under_allowed(path: str) -> str:
+    """Resolve path and verify it falls under an allowed root directory."""
+    resolved = os.path.realpath(path)
+    if not any(
+        resolved.startswith(os.path.realpath(root) + os.sep) or resolved == os.path.realpath(root)
+        for root in ALLOWED_ROOTS
+    ):
+        raise ValueError(f"Path outside allowed roots: {path}")
+    return resolved
 
 
 # ---------- Shared FLOPs Calculation Utilities ----------
@@ -184,7 +216,7 @@ class NvmlSampler:
     def start(self):
         try:
             pynvml.nvmlInit()
-        except Exception:
+        except (pynvml.NVMLError, OSError):
             return
         self.start_ts = now_s()
         self._thread = threading.Thread(target=self._run, daemon=True)
@@ -197,7 +229,7 @@ class NvmlSampler:
         self.end_ts = now_s()
         try:
             pynvml.nvmlShutdown()
-        except Exception:
+        except (pynvml.NVMLError, OSError):
             pass
 
     def _run(self):
@@ -320,6 +352,16 @@ class FlopsMeterCallback(TrainerCallback):
         model_name: str = "",
         num_epochs: float = 0.0,
     ):
+        # F7: Validate pad_token_id — default -100 is HF ignore-index, not a real pad id
+        if pad_token_id == -100:
+            import warnings
+            warnings.warn(
+                "pad_token_id is -100 (HF ignore-index default). This might inflate "
+                "token counts used for EU AI Act FLOPs attestation. Set pad_token_id "
+                "explicitly from your tokenizer.",
+                UserWarning,
+                stacklevel=2,
+            )
         self.pad_token_id = pad_token_id
         self.pretrain_flops = pretrain_flops
         self.sample_nvml = sample_nvml and (os.getenv("FLOPS_METER_NVML", "1") == "1")
@@ -366,10 +408,10 @@ class FlopsMeterCallback(TrainerCallback):
         self.start_time = time.time()
         if get_rank() == 0:
             print(
-                f"[FLOPS] N_total={self.m.N_total}  N_trainable={self.m.N_trainable}"
+                f"[FLOPs] N_total={self.m.N_total}  N_trainable={self.m.N_trainable}"
             )
             print(
-                f"[FLOPS DEBUG] on_train_begin called, pad_token_id={self.pad_token_id}"
+                f"[FLOPs DEBUG] on_train_begin called, pad_token_id={self.pad_token_id}"
             )
 
         if self._nvml:
@@ -396,16 +438,16 @@ class FlopsMeterCallback(TrainerCallback):
                 self.m.tokens_processed += int(batch_tokens)
                 if get_rank() == 0 and state.global_step <= 3:
                     print(
-                        f"[FLOPS DEBUG] on_substep_end step={state.global_step}, "
+                        f"[FLOPs DEBUG] on_substep_end step={state.global_step}, "
                         f"batch_tokens={batch_tokens}, total={self.m.tokens_processed}"
                     )
-            except Exception as e:
+            except (RuntimeError, TypeError, AttributeError) as e:
                 if get_rank() == 0 and state.global_step <= 3:
-                    print(f"[FLOPS WARN] token count failed: {e}")
+                    print(f"[FLOPs WARN] token count failed: {e}")
         else:
             if get_rank() == 0 and state.global_step <= 3:
                 print(
-                    f"[FLOPS DEBUG] on_substep_end step={state.global_step}, NO INPUTS in kwargs"
+                    f"[FLOPs DEBUG] on_substep_end step={state.global_step}, NO INPUTS in kwargs"
                 )
         return control
 
@@ -419,7 +461,7 @@ class FlopsMeterCallback(TrainerCallback):
         # Debug logging
         if get_rank() == 0 and state.global_step <= 3:
             print(
-                f"[FLOPS DEBUG] on_step_end step={state.global_step}, tokens_processed={self.m.tokens_processed}"
+                f"[FLOPs DEBUG] on_step_end step={state.global_step}, tokens_processed={self.m.tokens_processed}"
             )
         return control
 
@@ -536,15 +578,20 @@ class FlopsMeterCallback(TrainerCallback):
         out["training_id"] = training_id
 
         # Add recipe config filename and full details
-        # Read from hyperparameters.json (SageMaker training job config)
+        # Read from hyperparameters.json (Amazon SageMaker AI training job config)
         recipe_config_path = ""
         hyperparams_path = "/opt/ml/input/config/hyperparameters.json"
         if os.path.exists(hyperparams_path):
             try:
-                with open(hyperparams_path, "r") as f:
+                safe_hp_path = _safe_under_allowed(hyperparams_path)
+                with open(safe_hp_path, "r") as f:
                     hyperparams = json.load(f)
-                    recipe_config_path = hyperparams.get("config", "")
-            except Exception as e:
+                    config_val = hyperparams.get("config", "")
+                    if isinstance(config_val, str) and len(config_val) < 1024:
+                        recipe_config_path = config_val
+                    elif get_rank() == 0:
+                        print("  Warning: hyperparameters 'config' value invalid or too long")
+            except (json.JSONDecodeError, OSError, ValueError) as e:
                 if get_rank() == 0:
                     print(f"  Warning: Failed to read hyperparameters.json: {e}")
 
@@ -557,21 +604,26 @@ class FlopsMeterCallback(TrainerCallback):
                 # Strip surrounding quotes if present
                 recipe_config_path = recipe_config_path.strip('"').strip("'")
 
+                # Reject absolute paths and path traversal
+                if os.path.isabs(recipe_config_path) or ".." in recipe_config_path:
+                    raise ValueError(f"Rejected recipe config path: {recipe_config_path}")
+
                 # Try to find the file in common locations
                 possible_paths = [
                     os.path.join(
                         "/opt/ml/code", recipe_config_path
-                    ),  # SageMaker code dir with full path
+                    ),  # Amazon SageMaker AI code dir with full path
                     recipe_config_path,  # Direct path
                     os.path.join(os.getcwd(), recipe_config_path),  # Current dir
                 ]
 
                 for path in possible_paths:
                     if os.path.exists(path):
-                        with open(path, "r") as f:
+                        safe_path = _safe_under_allowed(path)
+                        with open(safe_path, "r") as f:
                             recipe_config_details = yaml.safe_load(f)
                         if get_rank() == 0:
-                            print(f"  Recipe config loaded from: {path}")
+                            print(f"  Recipe config loaded from: {safe_path}")
                         break
 
                 if recipe_config_details is None and get_rank() == 0:
@@ -579,7 +631,7 @@ class FlopsMeterCallback(TrainerCallback):
                         f"  Warning: Recipe config file not found: {recipe_config_path}"
                     )
                     print(f"  Searched paths: {possible_paths}")
-            except Exception as e:
+            except (yaml.YAMLError, OSError, ValueError) as e:
                 if get_rank() == 0:
                     print(f"  Warning: Failed to load recipe config: {e}")
 
@@ -607,12 +659,20 @@ class FlopsMeterCallback(TrainerCallback):
         if get_rank() == 0 and model_package_group_name:
             print(f"  Model Package Group: {model_package_group_name}")
 
-        # Write locally and to S3
+        # Write locally and to Amazon S3
         is_sagemaker = os.path.exists("/opt/ml/output") or "SM_MODEL_DIR" in os.environ
         default_path = (
             "/opt/ml/output/flops_meter.json" if is_sagemaker else "./flops_meter.json"
         )
         out_path = os.getenv("FLOPS_METER_OUT", default_path)
+
+        # F8: Validate output path is under allowed directories
+        try:
+            out_path = _safe_under_allowed(out_path)
+        except ValueError:
+            if get_rank() == 0:
+                print(f"  Warning: FLOPS_METER_OUT path rejected, using default: {default_path}")
+            out_path = default_path
 
         if get_rank() == 0:
             # Save locally
@@ -629,18 +689,50 @@ class FlopsMeterCallback(TrainerCallback):
             print(f"  Training duration: {out['training_duration_seconds']: .2f}s")
             print(f"  Local file: {out_path}")
 
-            # Upload to S3 using training ID
+            # Upload to Amazon S3 using training ID
             s3_base = os.getenv("TRAINING_PIPELINE_OUTPUT_S3_BASE")
-            s3_uri = f"{s3_base}/{training_id}/evaluation_results"
-            try:
-                s3 = boto3.client("s3")
-                s3_path = s3_uri.replace("s3://", "")
-                bucket, key = s3_path.split("/", 1)
-                s3_key = f"{key}/flops_meter.json"
-                s3.put_object(Bucket=bucket, Key=s3_key, Body=json.dumps(out, indent=2))
-                print(f"  S3 upload: s3: //{bucket}/{s3_key}")
-            except Exception as e:
-                print(f"  S3 upload failed: {e}")
+            if s3_base:
+                # F2: Validate S3 destination
+                if not s3_base.startswith("s3://"):
+                    print(f"  S3 upload skipped: TRAINING_PIPELINE_OUTPUT_S3_BASE must start with s3://")
+                # F3: Validate training_id
+                elif not training_id or not re.fullmatch(r"[A-Za-z0-9_\-]+", training_id):
+                    print(f"  S3 upload skipped: invalid or empty training_id: {training_id!r}")
+                else:
+                    try:
+                        parsed = urlparse(s3_base)
+                        bucket = parsed.netloc
+                        base_key = parsed.path.lstrip("/")
+                        if not bucket:
+                            raise ValueError("Could not parse bucket from S3 URI")
+                        s3_key = f"{base_key}/{training_id}/evaluation_results/flops_meter.json"
+
+                        s3 = boto3.client("s3")
+                        # F1: Server-side encryption
+                        put_kwargs = {
+                            "Bucket": bucket,
+                            "Key": s3_key,
+                            "Body": json.dumps(out, indent=2),
+                            "ContentType": "application/json",
+                            "ServerSideEncryption": "aws:kms",
+                        }
+                        kms_key_id = os.getenv("FLOPS_METER_KMS_KEY_ID")
+                        if kms_key_id:
+                            put_kwargs["SSEKMSKeyId"] = kms_key_id
+                        else:
+                            # Fall back to AES256 if no KMS key configured
+                            put_kwargs["ServerSideEncryption"] = "AES256"
+
+                        response = s3.put_object(**put_kwargs)
+                        # F9: Record upload result for audit
+                        out["s3_upload_etag"] = response.get("ETag")
+                        out["s3_upload_version_id"] = response.get("VersionId")
+                        # Re-save locally with audit fields
+                        with open(out_path, "w") as f:
+                            json.dump(out, f, indent=2)
+                        print(f"  S3 upload: s3://{bucket}/{s3_key}")
+                    except (botocore.exceptions.ClientError, ValueError, OSError) as e:
+                        print(f"  S3 upload failed: {e}")
 
             print("=" * 60 + "\n")
 
@@ -659,8 +751,8 @@ class FlopsMeterCallback(TrainerCallback):
 
 class TokenCountingTrainer(Trainer):
     """
-    Counts non-pad tokens directly inside training_step (always has inputs here),
-    then forwards to Trainer.training_step.
+    Counts non-pad tokens directly inside training_step (inputs are typically
+    available here), then forwards to Trainer.training_step.
     """
 
     def training_step(self, model, inputs, num_items_in_batch=None):
