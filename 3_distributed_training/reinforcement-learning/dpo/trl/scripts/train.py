@@ -569,11 +569,18 @@ def load_model(
         # if not script_args.load_in_4bit:
         #     model = ensure_uniform_dtype(model, config_builder.torch_dtype)
 
-        # Apply gradient checkpointing configuration
+        # Apply gradient checkpointing configuration.
+        # User-provided gradient_checkpointing_kwargs in the YAML wins. If the user
+        # didn't pin use_reentrant, fall back to the strategy-appropriate default:
+        # FSDP/DDP -> non-reentrant, DeepSpeed ZeRO-3 -> reentrant (non-reentrant's
+        # saved_tensors_hooks see partitioned weights on backward and raise CheckpointError).
         if config_builder.training_args.gradient_checkpointing:
-            model.gradient_checkpointing_enable(
-                gradient_checkpointing_kwargs={"use_reentrant": False}
+            gc_kwargs = dict(
+                config_builder.training_args.gradient_checkpointing_kwargs or {}
             )
+            if "use_reentrant" not in gc_kwargs:
+                gc_kwargs["use_reentrant"] = bool(config_builder.use_deepspeed)
+            model.gradient_checkpointing_enable(gradient_checkpointing_kwargs=gc_kwargs)
 
         return model
     except Exception as e:
@@ -798,8 +805,7 @@ def _merge_adapter_via_subprocess(
     Auto-detects whether the base model is a VLM from the adapter config and
     loads with the correct auto class to preserve vision encoder weights.
     """
-    merge_script = textwrap.dedent(
-        f"""\
+    merge_script = textwrap.dedent(f"""\
         import glob
         import os
         import torch
@@ -906,8 +912,7 @@ def _merge_adapter_via_subprocess(
         )
 
         print("Merge complete!")
-    """
-    )
+    """)
 
     clean_env = {
         k: v
