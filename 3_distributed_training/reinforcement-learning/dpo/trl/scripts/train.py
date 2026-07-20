@@ -58,6 +58,16 @@ class ScriptArguments:
     attn_implementation: Optional[str] = field(
         default="flash_attention_2", metadata={"help": "Attention implementation"}
     )
+    auto_calculate_lengths: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Auto-calculate DPOConfig.max_length (prompt + completion) from the "
+                "95th-percentile token length of the dataset, aligned to a multiple of 64. "
+                "Ignored when max_length is set explicitly in the config."
+            )
+        },
+    )
     checkpoint_dir: str = field(default=None, metadata={"help": "Checkpoint directory"})
     deserialize_messages: bool = field(
         default=False,
@@ -132,7 +142,7 @@ class ScriptArguments:
         metadata={
             "help": (
                 "Patch PEFT's FSDP auto-wrap policy for architectures PEFT doesn't "
-                "recognize (e.g. Qwen3.5). FSDP + LoRA only."
+                "recognize. FSDP + LoRA only."
             )
         },
     )
@@ -141,7 +151,7 @@ class ScriptArguments:
         metadata={
             "help": (
                 "Cast all model parameters to uniform dtype. Required for models "
-                "with mixed float32/bfloat16 parameters (e.g. Qwen3.5 inv_freq). "
+                "with mixed float32/bfloat16 parameters."
                 "Needed for both FSDP and DeepSpeed."
             )
         },
@@ -394,39 +404,11 @@ def setup_wandb(script_args: ScriptArguments) -> None:
         return None
 
 
-def ensure_uniform_dtype(
-    model: AutoModelForCausalLM, target_dtype: torch.dtype
-) -> AutoModelForCausalLM:
-    """Ensure all model parameters have uniform dtype for FSDP compatibility.
-
-    This is especially important for MoE (Mixture of Experts) models like Nemotron
-    where router/gate modules may initialize in float32 even when bfloat16 is specified.
-    """
-    mixed_dtypes = set()
-    for name, param in model.named_parameters():
-        if param.dtype != target_dtype:
-            mixed_dtypes.add((name, param.dtype))
-
-    if mixed_dtypes:
-        logger.warning(
-            f"Found {len(mixed_dtypes)} parameters with non-uniform dtype. Converting to {target_dtype}"
-        )
-        for name, dtype in list(mixed_dtypes)[:5]:  # Log first 5 examples
-            logger.warning(f"  - {name}: {dtype}")
-        if len(mixed_dtypes) > 5:
-            logger.warning(f"  ... and {len(mixed_dtypes) - 5} more")
-
-        # Cast all parameters to target dtype
-        model = model.to(target_dtype)
-
-    return model
-
-
 def patch_peft_fsdp_auto_wrap_policy():
     """Patch PEFT's fsdp_auto_wrap_policy for model architectures that PEFT doesn't recognize.
 
     PEFT's implementation inspects the model to find the transformer layer class but fails
-    on newer architectures (e.g. Qwen3.5). This patch catches the exception and auto-detects
+    on newer architectures. This patch catches the exception and auto-detects
     the decoder layer class by scanning for modules with 'DecoderLayer' in their class name.
 
     This is safe to call unconditionally — if PEFT's original function works, the patch
@@ -460,14 +442,30 @@ def patch_peft_fsdp_auto_wrap_policy():
             )
             from peft.tuners import PrefixEncoder, PromptEmbedding, PromptEncoder
 
-            peft_cls = (PrefixEncoder, PromptEmbedding, PromptEncoder)
+            peft_prompt_learning_cls = [PrefixEncoder, PromptEmbedding, PromptEncoder]
+            try:
+                from peft.tuners import CartridgeEncoder
+
+                peft_prompt_learning_cls.append(CartridgeEncoder)
+            except ImportError:
+                pass
+
+            def _leaf_with_trainable_weight(module):
+                # Matches PEFT's real lambda_policy_fn: wrap any leaf module that
+                # owns a trainable weight (e.g. LoRA's lora_A/lora_B) as its own
+                # FSDP unit, separate from the frozen decoder layer around it.
+                return (
+                    len(list(module.named_children())) == 0
+                    and getattr(module, "weight", None) is not None
+                    and module.weight.requires_grad
+                )
+
             lambda_policy = functools.partial(
-                lambda_auto_wrap_policy,
-                lambda_fn=lambda module: isinstance(module, peft_cls),
+                lambda_auto_wrap_policy, lambda_fn=_leaf_with_trainable_weight
             )
             transformer_policy = functools.partial(
                 transformer_auto_wrap_policy,
-                transformer_layer_cls={decoder_layer_cls},
+                transformer_layer_cls={decoder_layer_cls, *peft_prompt_learning_cls},
             )
             return functools.partial(
                 _or_policy, policies=[lambda_policy, transformer_policy]
@@ -477,24 +475,98 @@ def patch_peft_fsdp_auto_wrap_policy():
     logger.info("PEFT FSDP auto-wrap policy patch applied")
 
 
-def cast_parameters_to_uniform_dtype(model, target_dtype: torch.dtype) -> int:
-    """Cast all model parameters to a uniform dtype for FSDP compatibility.
+def cast_parameters_to_uniform_dtype(
+    model,
+    target_dtype: torch.dtype,
+    cast_buffers: bool = True,
+    exclude_buffer_pattern: Optional[str] = None,
+) -> int:
+    """Cast ordinary floating-point base-model params (and optionally buffers) to a
+    uniform dtype so FSDP1 can flatten them into a single FlatParameter.
 
-    Some model architectures (e.g. Qwen3.5) have parameters like inv_freq in
-    rotary embeddings that remain float32 even when loaded with torch_dtype=bfloat16.
-    FSDP requires all parameters to have the same dtype, and mixed dtypes also cause
-    gradient checkpointing recomputation mismatches (PyTorch issue #159359).
+    FSDP1 needs a uniform dtype only among parameters flattened into the same FSDP
+    unit. In HF/Accelerate that unit is a whole layer class, so an fp32 island inside
+    an otherwise-bf16 layer -- a module transformers keeps in fp32
+    (`_keep_in_fp32_modules`), or an fp32 rotary `inv_freq` buffer / Mamba-MoE router
+    param -- triggers `Must flatten tensors with uniform dtype ... float32 and
+    bfloat16`. Mixed dtypes also cause gradient-checkpointing recomputation
+    mismatches (PyTorch issue #159359), which is why floating-point buffers are cast
+    too (they are checked via named_buffers(), e.g. non-persistent rotary inv_freq).
 
-    Returns the number of parameters that were cast.
+    Call this BEFORE apply_lora_config(): PEFT's get_peft_model() upcasts LoRA adapter
+    weights to float32 (autocast_adapter_dtype=True, the default) for training
+    stability; casting afterwards would silently undo that and train LoRA in bf16.
+
+    Safety:
+      * Only floating-point tensors are cast; quantized/packed params (bitsandbytes
+        Params4bit/Int8Params, etc.) and meta/DTensor tensors are skipped so their
+        packed storage is never corrupted.
+      * When target_dtype != float32, modules transformers deliberately keeps in fp32
+        (`_keep_in_fp32_modules`) are downcast and warned about -- fine for a frozen
+        LoRA base, riskier for full fine-tuning (prefer FSDP2 / MixedPrecision there).
+      * Pass exclude_buffer_pattern=r"inv_freq|rotary" on long-context runs to keep
+        rotary frequencies in fp32 (RoPE phase error grows with position).
+      * Tied weights are re-tied after casting, since .to() allocates new tensors.
+
+    Returns the number of parameters/buffers that were cast.
     """
+    quantized_param_types = {
+        "Params4bit",
+        "Int8Params",
+        "Params8bit",
+        "FP8Parameter",
+    }
+    keep_fp32 = set(getattr(model, "_keep_in_fp32_modules", None) or [])
+    buf_exclude = None
+    if exclude_buffer_pattern:
+        import re
+
+        buf_exclude = re.compile(exclude_buffer_pattern)
+
     cast_count = 0
+    downcast_kept_fp32 = []
     for name, param in model.named_parameters():
-        if param.dtype != target_dtype:
-            param.data = param.data.to(target_dtype)
+        if (
+            type(param).__name__ in quantized_param_types
+            or not param.is_floating_point()
+            or param.is_meta
+            or type(param.data).__name__ == "DTensor"
+            or param.dtype == target_dtype
+        ):
+            continue
+        if (
+            keep_fp32
+            and target_dtype != torch.float32
+            and any(k in name for k in keep_fp32)
+        ):
+            downcast_kept_fp32.append(name)
+        param.data = param.data.to(target_dtype)
+        cast_count += 1
+
+    if cast_buffers:
+        for name, buf in model.named_buffers():
+            if (
+                not buf.is_floating_point()
+                or buf.is_meta
+                or buf.dtype == target_dtype
+                or (buf_exclude is not None and buf_exclude.search(name))
+            ):
+                continue
+            buf.data = buf.data.to(target_dtype)
             cast_count += 1
+
+    if cast_count > 0 and hasattr(model, "tie_weights"):
+        model.tie_weights()
+
+    if downcast_kept_fp32:
+        logger.warning(
+            f"Downcast {len(downcast_kept_fp32)} module(s) transformers keeps in fp32 "
+            f"({', '.join(sorted(set(downcast_kept_fp32))[:5])}) to {target_dtype}; "
+            "fine for a frozen LoRA base, riskier for full fine-tuning."
+        )
     if cast_count > 0:
         logger.info(
-            f"Cast {cast_count} parameters from mixed dtypes to {target_dtype} for FSDP"
+            f"Cast {cast_count} parameters/buffers from mixed dtypes to {target_dtype} for FSDP"
         )
     return cast_count
 
@@ -565,10 +637,6 @@ def load_model(
                 script_args.model_id, **model_kwargs
             )
 
-        # # Ensure uniform dtype for FSDP compatibility (critical for MoE models like Nemotron)
-        # if not script_args.load_in_4bit:
-        #     model = ensure_uniform_dtype(model, config_builder.torch_dtype)
-
         # Apply gradient checkpointing configuration.
         # User-provided gradient_checkpointing_kwargs in the YAML wins. If the user
         # didn't pin use_reentrant, fall back to the strategy-appropriate default:
@@ -603,9 +671,12 @@ def load_tokenizer(script_args: ScriptArguments) -> AutoTokenizer:
 def load_processor(script_args: ScriptArguments):
     """Load processor for multimodal models. Returns None if unavailable."""
     try:
-        processor = AutoProcessor.from_pretrained(script_args.model_id)
-        if processor.tokenizer.pad_token is None:
-            processor.tokenizer.pad_token = processor.tokenizer.eos_token
+        processor = AutoProcessor.from_pretrained(
+            script_args.model_id, trust_remote_code=True
+        )
+        tokenizer = getattr(processor, "tokenizer", None)
+        if tokenizer is not None and tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
         logger.info(f"Loaded processor for {script_args.model_id}")
         return processor
     except Exception as e:
@@ -781,6 +852,27 @@ def _load_and_merge_adapter(adapter_dir: str, torch_dtype: torch.dtype):
     return merged_causal
 
 
+def _coerce_tied_weights_keys(model):
+    """Compatibility shim for save_pretrained across transformers versions.
+
+    transformers >= 5.x expects each module's ``_tied_weights_keys`` to be a dict
+    (``_get_tied_weight_keys`` calls ``.keys()`` on it during ``save_pretrained``).
+    Some remote-code models (e.g. NVIDIA Nemotron-H, which sets
+    ``_tied_weights_keys = ["lm_head.weight"]``) still use the old list convention,
+    triggering ``AttributeError: 'list' object has no attribute 'keys'`` at save time.
+
+    Convert any list/tuple/set form to ``{key: key}`` in place. transformers only
+    consumes the keys (as regex patterns matched against pointer-shared tensors), so
+    the mapping value is irrelevant, and this is a no-op on versions/models that
+    already use a dict.
+    """
+    for module in model.modules():
+        tied = getattr(module, "_tied_weights_keys", None)
+        if isinstance(tied, (list, tuple, set)):
+            module._tied_weights_keys = {k: k for k in tied}
+    return model
+
+
 def _merge_adapter_in_process(
     temp_dir: str,
     final_output_dir: str,
@@ -789,6 +881,7 @@ def _merge_adapter_in_process(
     """Merge LoRA adapter in the current process (for FSDP/DDP)."""
     with gpu_memory_manager():
         model = _load_and_merge_adapter(temp_dir, torch_dtype)
+        _coerce_tied_weights_keys(model)
         model.save_pretrained(
             final_output_dir, safe_serialization=True, max_shard_size="2GB"
         )
@@ -905,6 +998,12 @@ def _merge_adapter_via_subprocess(
                 model = vlm_model
 
         print("Saving merged model...")
+        # Compat: transformers >=5.x calls .keys() on each module's _tied_weights_keys;
+        # some remote-code models (e.g. Nemotron-H) declare it as a list. Coerce to a dict.
+        for _m in model.modules():
+            _tied = getattr(_m, "_tied_weights_keys", None)
+            if isinstance(_tied, (list, tuple, set)):
+                _m._tied_weights_keys = {{k: k for k in _tied}}
         model.save_pretrained(
             output_dir,
             safe_serialization=True,
@@ -999,11 +1098,11 @@ def save_model(
     trainer: DPOTrainer,
     model: AutoModelForCausalLM,
     tokenizer: AutoTokenizer,
+    processor,
     script_args: ScriptArguments,
     accelerator: Accelerator,
     mlflow_enabled: bool,
     final_output_dir: str,
-    processor=None,
 ) -> None:
     """Save the trained model with proper DeepSpeed ZeRO-3 handling and online merging."""
     logger.info("STARTING MODEL SAVE PROCESS")
@@ -1045,7 +1144,15 @@ def save_model(
                         "Skipping MLflow registration (model merged in subprocess)"
                     )
         else:
-            trainer.model.save_pretrained(temp_dir, safe_serialization=False)
+            # FSDP/DDP: use trainer.save_model so Accelerate honors the
+            # FULL_STATE_DICT type set above and gathers a full, unsharded adapter
+            # of plain tensors (this call must run on all ranks for the gather's
+            # collective). Calling trainer.model.save_pretrained directly bypasses
+            # that gather and pickles sharded FSDP DTensors; reloading them makes
+            # merge_and_unload()'s weight_B @ weight_A a DTensor reshard (all-to-all)
+            # on CPU, which fails with "No backend type associated with device type
+            # cpu" because the process group only has the GPU-only NCCL backend.
+            trainer.save_model(temp_dir)
             accelerator.wait_for_everyone()
 
             if accelerator.is_main_process:
@@ -1107,20 +1214,74 @@ def register_model_in_mlflow(
         raise
 
 
-def load_json_file(file_path: str) -> List[Dict]:
-    """Load JSON or JSONL file manually to avoid schema inference issues."""
-    data = []
-    with open(file_path, "r", encoding="utf-8") as f:
-        content = f.read().strip()
-        # Try to parse as JSON array first
-        if content.startswith("["):
-            data = json.loads(content)
-        else:
-            # Parse as JSONL (one JSON object per line)
-            for line in content.split("\n"):
-                if line.strip():
-                    data.append(json.loads(line))
-    return data
+def _align_to_multiple(value: int, multiple: int = 64) -> int:
+    """Round up to the next multiple for hardware efficiency."""
+    return ((value + multiple - 1) // multiple) * multiple
+
+
+def calculate_optimal_dpo_lengths(
+    tokenizer: AutoTokenizer,
+    dataset: Dataset,
+    deserialize_messages: bool = False,
+    sample_size: int = 1000,
+    percentile: float = 0.95,
+    max_absolute_length: int = 32768,
+) -> Optional[int]:
+    """Calculate an optimal DPOConfig.max_length (prompt + completion) from the dataset.
+
+    For each sampled row, renders ``prompt + chosen`` and ``prompt + rejected`` with
+    apply_chat_template and keeps the longer of the two token counts. Returns the
+    ``percentile`` length across samples, aligned up to a multiple of 64, or None if
+    no lengths could be computed (the caller then leaves max_length unchanged).
+
+    When ``deserialize_messages`` is True the dataset carries a lazy ``set_transform``
+    that parses JSON-encoded fields on access, so iterating here already yields native
+    message lists.
+    """
+    sample_indices = torch.randperm(len(dataset))[: min(sample_size, len(dataset))]
+    sample_data = dataset.select(sample_indices)
+
+    def _render(messages) -> int:
+        if isinstance(messages, list):
+            return len(tokenizer.apply_chat_template(messages, tokenize=True))
+        return len(tokenizer.encode(str(messages), add_special_tokens=True))
+
+    lengths = []
+    errors = 0
+    for sample in sample_data:
+        try:
+            prompt = sample.get("prompt")
+            chosen = sample.get("chosen")
+            rejected = sample.get("rejected")
+            if prompt is None or chosen is None or rejected is None:
+                errors += 1
+                continue
+
+            prompt_msgs = prompt if isinstance(prompt, list) else [prompt]
+            chosen_msgs = chosen if isinstance(chosen, list) else [chosen]
+            rejected_msgs = rejected if isinstance(rejected, list) else [rejected]
+
+            len_chosen = _render(prompt_msgs + chosen_msgs)
+            len_rejected = _render(prompt_msgs + rejected_msgs)
+            lengths.append(max(len_chosen, len_rejected))
+        except Exception as e:
+            errors += 1
+            if errors <= 3:
+                logger.warning(f"DPO length calc error: {e}")
+
+    valid = [length for length in lengths if length <= max_absolute_length]
+    outliers = len(lengths) - len(valid)
+    if not valid:
+        logger.warning("Could not compute DPO lengths; leaving max_length unchanged")
+        return None
+
+    p_length = int(sorted(valid)[int(percentile * len(valid))])
+    max_length = _align_to_multiple(p_length)
+    logger.info(f"Analyzed {len(valid)} samples ({outliers} outliers, {errors} errors)")
+    logger.info(f"Average length: {sum(valid) / len(valid):.1f}")
+    logger.info(f"{percentile * 100}th percentile length: {p_length}")
+    logger.info(f"Estimated max_length (aligned to 64): {max_length}")
+    return max_length
 
 
 def deserialize_conversations(dataset: Dataset) -> Dataset:
@@ -1133,37 +1294,52 @@ def deserialize_conversations(dataset: Dataset) -> Dataset:
     """
 
     def _parse_field(value):
-        return json.loads(value) if isinstance(value, str) else value
+        # Deserialize only JSON-encoded *structures* (serialized message lists/dicts,
+        # which start with '[' or '{'). Everything else is returned unchanged:
+        #   - native list/dict            -> passthrough (idempotent)
+        #   - standard-format plain text  -> passthrough (never raises)
+        #   - bare scalars like "4"/"true"-> stay strings (not coerced to int/bool)
+        if isinstance(value, str) and value.lstrip()[:1] in ("[", "{"):
+            try:
+                return json.loads(value)
+            except (json.JSONDecodeError, ValueError):
+                return value
+        return value
 
     def transform(batch):
-        batch_size = len(batch["prompt"])
-        prompts = []
-        chosens = []
-        rejecteds = []
+        if "prompt" not in batch:
+            # Raw columns already stripped (e.g. remove_unused_columns=True ran after
+            # DPOTrainer's own tokenization) — nothing left for this transform to do.
+            return batch
 
+        has_chosen = "chosen" in batch
+        has_rejected = "rejected" in batch
+        system = batch.get("system")
+        batch_size = len(batch["prompt"])
+
+        prompts, chosens, rejecteds = [], [], []
         for i in range(batch_size):
             prompt = _parse_field(batch["prompt"][i])
-            chosen = _parse_field(batch["chosen"][i])
-            rejected = _parse_field(batch["rejected"][i])
 
-            # Prepend system message to prompt if present
-            messages = []
-            system = batch.get("system")
-            if system and system[i]:
-                messages.append({"role": "system", "content": system[i]})
-            messages.extend(prompt)
+            # Conversational format: prompt is a list of message dicts, so prepend a
+            # separate `system` column when present. Standard format: prompt is a
+            # plain string and is left exactly as-is (no system merge, no iteration).
+            if isinstance(prompt, list) and system and system[i]:
+                prompt = [{"role": "system", "content": system[i]}] + prompt
 
-            prompts.append(messages)
-            chosens.append(chosen)
-            rejecteds.append(rejected)
+            prompts.append(prompt)
+            if has_chosen:
+                chosens.append(_parse_field(batch["chosen"][i]))
+            if has_rejected:
+                rejecteds.append(_parse_field(batch["rejected"][i]))
 
-        result = {
-            "prompt": prompts,
-            "chosen": chosens,
-            "rejected": rejecteds,
-        }
+        result = {"prompt": prompts}
+        if has_chosen:
+            result["chosen"] = chosens
+        if has_rejected:
+            result["rejected"] = rejecteds
 
-        # Preserve extra fields
+        # Preserve extra fields (drop the now-merged system column)
         for key in batch:
             if key not in ("system", "prompt", "chosen", "rejected"):
                 result[key] = batch[key]
@@ -1277,11 +1453,34 @@ def train(script_args, training_args, train_ds, test_ds):
                 "Multi-modal mode: using processor as processing_class for DPOTrainer"
             )
 
+    # Auto-calculate DPOConfig.max_length (prompt + completion) from the dataset when
+    # requested and not set explicitly. Skipped for image modality, where sequences
+    # include image tokens the tokenizer cannot measure here and max_length is forced
+    # to None below anyway.
+    if (
+        script_args.auto_calculate_lengths
+        and not is_vlm
+        and getattr(training_args, "max_length", None) is None
+    ):
+        logger.info("Auto-calculating optimal DPO max_length from dataset...")
+        computed_max_length = calculate_optimal_dpo_lengths(
+            tokenizer, train_ds, deserialize_messages=script_args.deserialize_messages
+        )
+        if computed_max_length is not None:
+            training_args.max_length = computed_max_length
+            logger.info(f"Set max_length={computed_max_length}")
+
     # Extract tools from dataset if available
     tools = extract_tools_from_dataset(train_ds)
     if tools:
         logger.info(f"Found {len(tools)} tools in dataset")
         training_args.tools = tools
+
+    # Cast the frozen base model's params/buffers to a uniform dtype BEFORE LoRA is
+    # applied, so PEFT's fp32 upcast of the adapter weights (see apply_lora_config /
+    # get_peft_model) is preserved instead of being immediately overwritten.
+    if script_args.cast_parameters_to_uniform_dtype:
+        cast_parameters_to_uniform_dtype(model, config_builder.torch_dtype)
 
     # Apply PEFT before trainer (same as SFT) for FSDP compatibility
     if script_args.use_peft:
@@ -1294,8 +1493,6 @@ def train(script_args, training_args, train_ds, test_ds):
         and training_args.fsdp != ""
     ):
         patch_peft_fsdp_auto_wrap_policy()
-    if script_args.cast_parameters_to_uniform_dtype:
-        cast_parameters_to_uniform_dtype(model, config_builder.torch_dtype)
 
     callbacks = setup_wandb(script_args)
     if script_args.early_stopping:
@@ -1400,11 +1597,11 @@ def train(script_args, training_args, train_ds, test_ds):
         trainer,
         model,
         tokenizer,
+        processor,
         script_args,
         trainer.accelerator,
         mlflow_enabled,
         original_output_dir,
-        processor=processor,
     )
     trainer.accelerator.wait_for_everyone()
 

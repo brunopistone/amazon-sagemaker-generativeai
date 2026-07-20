@@ -122,6 +122,25 @@ class ScriptArguments:
     wandb_project: str = field(
         default="project", metadata={"help": "Wandb project name"}
     )
+    patch_peft_fsdp_auto_wrap_policy: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Patch PEFT's FSDP auto-wrap policy for architectures PEFT doesn't "
+                "recognize. FSDP + LoRA only."
+            )
+        },
+    )
+    cast_parameters_to_uniform_dtype: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Cast all model parameters to uniform dtype. Required for models "
+                "with mixed float32/bfloat16 parameters. "
+                "Needed for both FSDP and DeepSpeed."
+            )
+        },
+    )
 
 
 class ModelConfigBuilder:
@@ -341,6 +360,173 @@ def setup_wandb(script_args: ScriptArguments) -> None:
         return None
 
 
+def patch_peft_fsdp_auto_wrap_policy():
+    """Patch PEFT's fsdp_auto_wrap_policy for model architectures that PEFT doesn't recognize.
+
+    PEFT's implementation inspects the model to find the transformer layer class but fails
+    on newer architectures (e.g. Qwen3.5). This patch catches the exception and auto-detects
+    the decoder layer class by scanning for modules with 'DecoderLayer' in their class name.
+
+    This is safe to call unconditionally — if PEFT's original function works, the patch
+    is a no-op pass-through.
+    """
+    import functools
+    from torch.distributed.fsdp.wrap import (
+        transformer_auto_wrap_policy,
+        _or_policy,
+        lambda_auto_wrap_policy,
+    )
+    import peft.utils.other
+
+    _original_fsdp_auto_wrap_policy = peft.utils.other.fsdp_auto_wrap_policy
+
+    def _patched_fsdp_auto_wrap_policy(model):
+        try:
+            return _original_fsdp_auto_wrap_policy(model)
+        except Exception:
+            base = model.base_model.model if hasattr(model, "base_model") else model
+            decoder_layer_cls = None
+            for _, module in base.named_modules():
+                cls_name = type(module).__name__
+                if "DecoderLayer" in cls_name:
+                    decoder_layer_cls = type(module)
+                    break
+            if decoder_layer_cls is None:
+                raise
+            logger.info(
+                f"Patched FSDP auto-wrap policy to use {decoder_layer_cls.__name__}"
+            )
+            from peft.tuners import PrefixEncoder, PromptEmbedding, PromptEncoder
+
+            peft_prompt_learning_cls = [PrefixEncoder, PromptEmbedding, PromptEncoder]
+            try:
+                from peft.tuners import CartridgeEncoder
+
+                peft_prompt_learning_cls.append(CartridgeEncoder)
+            except ImportError:
+                pass
+
+            def _leaf_with_trainable_weight(module):
+                # Matches PEFT's real lambda_policy_fn: wrap any leaf module that
+                # owns a trainable weight (e.g. LoRA's lora_A/lora_B) as its own
+                # FSDP unit, separate from the frozen decoder layer around it.
+                return (
+                    len(list(module.named_children())) == 0
+                    and getattr(module, "weight", None) is not None
+                    and module.weight.requires_grad
+                )
+
+            lambda_policy = functools.partial(
+                lambda_auto_wrap_policy, lambda_fn=_leaf_with_trainable_weight
+            )
+            transformer_policy = functools.partial(
+                transformer_auto_wrap_policy,
+                transformer_layer_cls={decoder_layer_cls, *peft_prompt_learning_cls},
+            )
+            return functools.partial(
+                _or_policy, policies=[lambda_policy, transformer_policy]
+            )
+
+    peft.utils.other.fsdp_auto_wrap_policy = _patched_fsdp_auto_wrap_policy
+    logger.info("PEFT FSDP auto-wrap policy patch applied")
+
+
+def cast_parameters_to_uniform_dtype(
+    model,
+    target_dtype: torch.dtype,
+    cast_buffers: bool = True,
+    exclude_buffer_pattern: Optional[str] = None,
+) -> int:
+    """Cast ordinary floating-point base-model params (and optionally buffers) to a
+    uniform dtype so FSDP1 can flatten them into a single FlatParameter.
+
+    FSDP1 needs a uniform dtype only among parameters flattened into the same FSDP
+    unit. In HF/Accelerate that unit is a whole layer class, so an fp32 island inside
+    an otherwise-bf16 layer -- a module transformers keeps in fp32
+    (`_keep_in_fp32_modules`), or an fp32 rotary `inv_freq` buffer / Mamba-MoE router
+    param -- triggers `Must flatten tensors with uniform dtype ... float32 and
+    bfloat16`. Mixed dtypes also cause gradient-checkpointing recomputation
+    mismatches (PyTorch issue #159359), which is why floating-point buffers are cast
+    too (they are checked via named_buffers(), e.g. non-persistent rotary inv_freq).
+
+    Call this BEFORE apply_lora_config(): PEFT's get_peft_model() upcasts LoRA adapter
+    weights to float32 (autocast_adapter_dtype=True, the default) for training
+    stability; casting afterwards would silently undo that and train LoRA in bf16.
+
+    Safety:
+      * Only floating-point tensors are cast; quantized/packed params (bitsandbytes
+        Params4bit/Int8Params, etc.) and meta/DTensor tensors are skipped so their
+        packed storage is never corrupted.
+      * When target_dtype != float32, modules transformers deliberately keeps in fp32
+        (`_keep_in_fp32_modules`) are downcast and warned about -- fine for a frozen
+        LoRA base, riskier for full fine-tuning (prefer FSDP2 / MixedPrecision there).
+      * Pass exclude_buffer_pattern=r"inv_freq|rotary" on long-context runs to keep
+        rotary frequencies in fp32 (RoPE phase error grows with position).
+      * Tied weights are re-tied after casting, since .to() allocates new tensors.
+
+    Returns the number of parameters/buffers that were cast.
+    """
+    quantized_param_types = {
+        "Params4bit",
+        "Int8Params",
+        "Params8bit",
+        "FP8Parameter",
+    }
+    keep_fp32 = set(getattr(model, "_keep_in_fp32_modules", None) or [])
+    buf_exclude = None
+    if exclude_buffer_pattern:
+        import re
+
+        buf_exclude = re.compile(exclude_buffer_pattern)
+
+    cast_count = 0
+    downcast_kept_fp32 = []
+    for name, param in model.named_parameters():
+        if (
+            type(param).__name__ in quantized_param_types
+            or not param.is_floating_point()
+            or param.is_meta
+            or type(param.data).__name__ == "DTensor"
+            or param.dtype == target_dtype
+        ):
+            continue
+        if (
+            keep_fp32
+            and target_dtype != torch.float32
+            and any(k in name for k in keep_fp32)
+        ):
+            downcast_kept_fp32.append(name)
+        param.data = param.data.to(target_dtype)
+        cast_count += 1
+
+    if cast_buffers:
+        for name, buf in model.named_buffers():
+            if (
+                not buf.is_floating_point()
+                or buf.is_meta
+                or buf.dtype == target_dtype
+                or (buf_exclude is not None and buf_exclude.search(name))
+            ):
+                continue
+            buf.data = buf.data.to(target_dtype)
+            cast_count += 1
+
+    if cast_count > 0 and hasattr(model, "tie_weights"):
+        model.tie_weights()
+
+    if downcast_kept_fp32:
+        logger.warning(
+            f"Downcast {len(downcast_kept_fp32)} module(s) transformers keeps in fp32 "
+            f"({', '.join(sorted(set(downcast_kept_fp32))[:5])}) to {target_dtype}; "
+            "fine for a frozen LoRA base, riskier for full fine-tuning."
+        )
+    if cast_count > 0:
+        logger.info(
+            f"Cast {cast_count} parameters/buffers from mixed dtypes to {target_dtype} for FSDP"
+        )
+    return cast_count
+
+
 def apply_lora_config(
     model: AutoModelForCausalLM, script_args: ScriptArguments
 ) -> AutoModelForCausalLM:
@@ -403,44 +589,82 @@ def load_tokenizer(script_args: ScriptArguments) -> AutoTokenizer:
 
 
 # Built-in reward functions
-def format_reward_func(completions: List[Dict], **kwargs) -> List[float]:
+def _extract_completion_text(completion: Any) -> str:
+    """Normalize a single GRPO completion to plain text.
+
+    GRPOTrainer passes completions in one of two shapes depending on the prompt
+    format:
+      - conversational prompt -> completion is a list of message dicts, e.g.
+        ``[{"role": "assistant", "content": "..."}]``
+      - standard (plain string) prompt -> completion is a plain ``str``
+
+    This helper handles both (plus a bare dict, defensively) so reward functions
+    never crash with ``'str' object has no attribute 'get'`` on standard-format
+    datasets.
+    """
+    if isinstance(completion, str):
+        return completion
+    if isinstance(completion, list):
+        if not completion:
+            return ""
+        first = completion[0]
+        return first.get("content", "") if isinstance(first, dict) else str(first)
+    if isinstance(completion, dict):
+        return completion.get("content", "")
+    return str(completion)
+
+
+def format_reward_func(completions: List, **kwargs) -> List[float]:
     """Rewards completions with <think>...</think> and <answer>...</answer> tags."""
     import re
 
     pattern = r"<think>.*?</think>\s*<answer>.*?</answer>"
-    responses = [
-        c[0]["content"] if isinstance(c, list) else c.get("content", str(c))
-        for c in completions
-    ]
+    responses = [_extract_completion_text(c) for c in completions]
     return [1.0 if re.search(pattern, r, re.DOTALL) else 0.0 for r in responses]
 
 
 def length_reward_func(
-    completions: List[Dict], target_length: int = 512, **kwargs
+    completions: List, target_length: int = 512, **kwargs
 ) -> List[float]:
     """Rewards completions based on length relative to target."""
-    responses = [
-        c[0]["content"] if isinstance(c, list) else c.get("content", str(c))
-        for c in completions
-    ]
+    responses = [_extract_completion_text(c) for c in completions]
     return [min(len(r), target_length) / target_length for r in responses]
 
 
 def rouge_reward_func(
-    completions: List[Dict], answer: List[str], **kwargs
+    completions: List, answer: Optional[List[str]] = None, **kwargs
 ) -> List[float]:
-    """Rewards completions based on ROUGE-L score against reference answers."""
+    """Rewards completions based on ROUGE-L precision against reference answers.
+
+    Requires an ``answer`` column in the dataset. Returns 0.0 for every completion
+    when references are missing or the ``rouge`` package is not installed, and
+    scores each pair independently so a single bad sample cannot zero out the whole
+    batch.
+    """
+    if answer is None:
+        logger.warning(
+            "rouge reward selected but no 'answer' column in dataset; returning 0.0"
+        )
+        return [0.0] * len(completions)
+
     try:
         from rouge import Rouge
-
-        rouge = Rouge()
-        responses = [
-            c[0]["content"] if isinstance(c, list) else c.get("content", str(c))
-            for c in completions
-        ]
-        return [s["rouge-l"]["p"] for s in rouge.get_scores(responses, answer)]
-    except Exception:
+    except ImportError:
+        logger.warning("rouge package not installed; rouge reward returns 0.0")
         return [0.0] * len(completions)
+
+    rouge = Rouge()
+    responses = [_extract_completion_text(c) for c in completions]
+    scores = []
+    for response, reference in zip(responses, answer):
+        # Rouge raises on empty strings; fall back to a space so the pair scores 0.
+        hyp = response if response and response.strip() else " "
+        ref = reference if isinstance(reference, str) and reference.strip() else " "
+        try:
+            scores.append(rouge.get_scores(hyp, ref)[0]["rouge-l"]["p"])
+        except Exception:
+            scores.append(0.0)
+    return scores
 
 
 BUILTIN_REWARDS = {
@@ -468,6 +692,27 @@ def load_reward_functions(reward_funcs_str: str) -> List[Callable]:
     return reward_funcs
 
 
+def _coerce_tied_weights_keys(model):
+    """Compatibility shim for save_pretrained across transformers versions.
+
+    transformers >= 5.x expects each module's ``_tied_weights_keys`` to be a dict
+    (``_get_tied_weight_keys`` calls ``.keys()`` on it during ``save_pretrained``).
+    Some remote-code models (e.g. NVIDIA Nemotron-H, which sets
+    ``_tied_weights_keys = ["lm_head.weight"]``) still use the old list convention,
+    triggering ``AttributeError: 'list' object has no attribute 'keys'`` at save time.
+
+    Convert any list/tuple/set form to ``{key: key}`` in place. transformers only
+    consumes the keys (as regex patterns matched against pointer-shared tensors), so
+    the mapping value is irrelevant, and this is a no-op on versions/models that
+    already use a dict.
+    """
+    for module in model.modules():
+        tied = getattr(module, "_tied_weights_keys", None)
+        if isinstance(tied, (list, tuple, set)):
+            module._tied_weights_keys = {k: k for k in tied}
+    return model
+
+
 def _merge_adapter_in_process(
     temp_dir: str, final_output_dir: str, torch_dtype: torch.dtype = torch.bfloat16
 ) -> AutoModelForCausalLM:
@@ -480,6 +725,7 @@ def _merge_adapter_in_process(
             trust_remote_code=True,
         )
         model = model.merge_and_unload()
+        _coerce_tied_weights_keys(model)
         model.save_pretrained(
             final_output_dir, safe_serialization=True, max_shard_size="2GB"
         )
@@ -506,6 +752,12 @@ def _merge_adapter_via_subprocess(
         model = model.merge_and_unload()
 
         print("Saving merged model...")
+        # Compat: transformers >=5.x calls .keys() on each module's _tied_weights_keys;
+        # some remote-code models (e.g. Nemotron-H) declare it as a list. Coerce to a dict.
+        for _m in model.modules():
+            _tied = getattr(_m, "_tied_weights_keys", None)
+            if isinstance(_tied, (list, tuple, set)):
+                _m._tied_weights_keys = {{k: k for k in _tied}}
         model.save_pretrained(
             "{final_output_dir}",
             safe_serialization=True,
@@ -590,7 +842,15 @@ def save_model(
                         "Skipping MLflow registration (model merged in subprocess)"
                     )
         else:
-            trainer.model.save_pretrained(temp_dir, safe_serialization=False)
+            # FSDP/DDP: use trainer.save_model so Accelerate honors the
+            # FULL_STATE_DICT type set above and gathers a full, unsharded adapter
+            # of plain tensors (this call must run on all ranks for the gather's
+            # collective). Calling trainer.model.save_pretrained directly bypasses
+            # that gather and pickles sharded FSDP DTensors; reloading them makes
+            # merge_and_unload()'s weight_B @ weight_A a DTensor reshard (all-to-all)
+            # on CPU, which fails with "No backend type associated with device type
+            # cpu" because the process group only has the GPU-only NCCL backend.
+            trainer.save_model(temp_dir)
             accelerator.wait_for_everyone()
 
             if accelerator.is_main_process:
@@ -726,10 +986,13 @@ def deserialize_prompt(dataset: Dataset, prompt_field: str = "prompt") -> Datase
 
     def process(sample):
         prompt = sample[prompt_field]
-        if isinstance(prompt, str):
+        # Only parse strings that look like a serialized structure ('[' or '{'), so
+        # standard plain-text prompts (and bare scalars like "4") are left as-is
+        # rather than raising or being coerced to non-string types.
+        if isinstance(prompt, str) and prompt.lstrip()[:1] in ("[", "{"):
             try:
                 prompt = json.loads(prompt)
-            except json.JSONDecodeError:
+            except (json.JSONDecodeError, ValueError):
                 pass  # Keep as plain string (standard format)
         return {prompt_field: prompt}
 
@@ -833,9 +1096,23 @@ def train(script_args, training_args, train_ds, test_ds):
         training_args.max_completion_length = max_completion_length
         logger.info(f"Set max_completion_length={max_completion_length}")
 
+    # Cast the frozen base model's params/buffers to a uniform dtype BEFORE LoRA is
+    # applied, so PEFT's fp32 upcast of the adapter weights (see apply_lora_config /
+    # get_peft_model) is preserved instead of being immediately overwritten.
+    if script_args.cast_parameters_to_uniform_dtype:
+        cast_parameters_to_uniform_dtype(model, config_builder.torch_dtype)
+
     # Apply PEFT before trainer (same as SFT) for FSDP compatibility
     if script_args.use_peft:
         model = apply_lora_config(model, script_args)
+
+    if (
+        script_args.patch_peft_fsdp_auto_wrap_policy
+        and script_args.use_peft
+        and training_args.fsdp
+        and training_args.fsdp != ""
+    ):
+        patch_peft_fsdp_auto_wrap_policy()
 
     callbacks = setup_wandb(script_args)
     if script_args.early_stopping:
