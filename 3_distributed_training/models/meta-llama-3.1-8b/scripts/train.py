@@ -47,7 +47,20 @@ from transformers.integrations import WandbCallback
 import contextlib
 from typing import Any, Dict, List, Optional, Tuple
 import wandb
-from distutils.util import strtobool
+
+try:
+    from distutils.util import strtobool
+except ImportError:  # distutils was removed from the stdlib in Python 3.12
+
+    def strtobool(val):
+        """String truthy/falsey -> 1/0 (distutils.util.strtobool replacement)."""
+        val = str(val).strip().lower()
+        if val in ("y", "yes", "t", "true", "on", "1"):
+            return 1
+        if val in ("n", "no", "f", "false", "off", "0"):
+            return 0
+        raise ValueError(f"invalid truth value {val!r}")
+
 
 # Configure logging
 logging.basicConfig(
