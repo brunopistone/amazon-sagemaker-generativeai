@@ -8,8 +8,9 @@ datasets==4.8.5
 deepspeed==0.19.1
 evaluate==0.4.6
 huggingface_hub[hf_transfer]
-kernels>=0.12.2,<0.15
+kernels>=0.15.2,<0.16
 mlflow
+Pillow>=10.0.1
 safetensors>=0.7.0
 sagemaker==3.16.0
 sagemaker-mlflow==0.2.0
