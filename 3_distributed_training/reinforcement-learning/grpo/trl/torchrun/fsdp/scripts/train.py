@@ -2,6 +2,7 @@ from accelerate import Accelerator
 from dataclasses import dataclass, field
 from datasets import Dataset, DatasetDict, load_dataset, load_from_disk
 import datetime
+from functools import lru_cache
 from huggingface_hub import snapshot_download
 import importlib
 import json
@@ -33,7 +34,20 @@ from transformers.integrations import WandbCallback
 import contextlib
 from typing import Any, Callable, Dict, List, Optional, Tuple
 import wandb
-from distutils.util import strtobool
+
+try:
+    from distutils.util import strtobool
+except ImportError:  # distutils was removed from the stdlib in Python 3.12
+
+    def strtobool(val):
+        """String truthy/falsey -> 1/0 (distutils.util.strtobool replacement)."""
+        val = str(val).strip().lower()
+        if val in ("y", "yes", "t", "true", "on", "1"):
+            return 1
+        if val in ("n", "no", "f", "false", "off", "0"):
+            return 0
+        raise ValueError(f"invalid truth value {val!r}")
+
 
 # Configure logging
 logging.basicConfig(
@@ -41,6 +55,76 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger(__name__)
+
+
+@lru_cache(maxsize=None)
+def resolve_trust_remote_code(
+    model_id: str, token: Optional[str] = None
+) -> Optional[bool]:
+    """Whether the repo's custom modeling code must be executed for `model_id`.
+
+    Returns `True` when the architecture has no native implementation, and `None`
+    when the argument should not be passed at all - either because a native
+    implementation exists or because `config.json` could not be read.
+
+    Transformers gives the remote `modeling_*.py` precedence over its own
+    implementation whenever `trust_remote_code=True` and the repo ships an
+    `auto_map`. That pins the model to the Transformers snapshot it was uploaded
+    with, which typically predates the AttentionInterface: no
+    `_supports_flash_attn` / `_supports_sdpa` flags (so `attn_implementation` is
+    rejected and only `eager` works), and legacy attention masks. So only opt in
+    when there is no native implementation for the architecture.
+    """
+    try:
+        from transformers import PreTrainedConfig
+    except ImportError:  # transformers < 5.0
+        from transformers import PretrainedConfig as PreTrainedConfig
+    from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING_NAMES
+
+    try:
+        from transformers.models.auto.modeling_auto import (
+            MODEL_FOR_IMAGE_TEXT_TO_TEXT_MAPPING_NAMES,
+        )
+    except ImportError:
+        MODEL_FOR_IMAGE_TEXT_TO_TEXT_MAPPING_NAMES = {}
+
+    try:
+        # Reads config.json only - executes no repository code.
+        config_dict, _ = PreTrainedConfig.get_config_dict(model_id, token=token)
+    except Exception as e:
+        logger.warning(
+            f"Could not inspect config.json for {model_id} ({e}); leaving "
+            "trust_remote_code unset so Transformers resolves it"
+        )
+        return None
+
+    model_type = config_dict.get("model_type")
+    if (
+        model_type in MODEL_FOR_CAUSAL_LM_MAPPING_NAMES
+        or model_type in MODEL_FOR_IMAGE_TEXT_TO_TEXT_MAPPING_NAMES
+    ):
+        return None
+    return True if config_dict.get("auto_map") else None
+
+
+def trust_remote_code_kwargs(
+    model_id: str,
+    token: Optional[str] = None,
+    override: Optional[bool] = None,
+) -> Dict[str, Any]:
+    """`{"trust_remote_code": ...}` only when the argument needs to be passed.
+
+    Omitting it is not the same as passing `False`: unset lets Transformers use
+    its own resolution (native class when available, and an actionable
+    "Please pass the argument `trust_remote_code=True`" when custom code is
+    genuinely required), while an explicit `False` refuses custom code outright
+    and reports the vaguer "Unrecognized configuration class". Loaders that do
+    not accept the argument also stay unaffected when it is left out.
+    """
+    value = (
+        override if override is not None else resolve_trust_remote_code(model_id, token)
+    )
+    return {} if value is None else {"trust_remote_code": bool(value)}
 
 
 @dataclass
@@ -99,6 +183,19 @@ class ScriptArguments:
         default=None, metadata={"help": "Target modules for LoRA"}
     )
     token: str = field(default=None, metadata={"help": "Hugging Face API token"})
+    trust_remote_code: Optional[bool] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Execute the repository's custom modeling code. Leave unset to "
+                "auto-detect: the native Transformers implementation is preferred "
+                "whenever one exists, and custom code is only used for "
+                "architectures Transformers does not implement. Forcing true on a "
+                "natively supported model silently downgrades it to a stale "
+                "snapshot (breaks flash_attention_2/3 and sdpa)."
+            )
+        },
+    )
     torch_dtype: Optional[str] = field(
         default="auto",
         metadata={"help": "Torch dtype (auto, bfloat16, float16, float32)"},
@@ -143,6 +240,15 @@ class ScriptArguments:
     )
 
 
+def trust_remote_code_for(script_args: ScriptArguments) -> Dict[str, Any]:
+    """`trust_remote_code` kwargs for the run's model: explicit config value wins."""
+    return trust_remote_code_kwargs(
+        script_args.model_id,
+        script_args.token,
+        override=script_args.trust_remote_code,
+    )
+
+
 class ModelConfigBuilder:
     """Centralized model configuration builder to eliminate duplicate logic."""
 
@@ -153,6 +259,7 @@ class ModelConfigBuilder:
         self._quantization_config = None
         self._use_deepspeed = None
         self._use_fsdp = None
+        self._trust_remote_code = None
 
     @property
     def torch_dtype(self) -> torch.dtype:
@@ -165,6 +272,17 @@ class ModelConfigBuilder:
             else:
                 self._torch_dtype = getattr(torch, self.script_args.torch_dtype)
         return self._torch_dtype
+
+    @property
+    def trust_remote_code(self) -> Dict[str, Any]:
+        """Resolve the `trust_remote_code` kwargs once per run (may be empty)."""
+        if self._trust_remote_code is None:
+            self._trust_remote_code = trust_remote_code_for(self.script_args)
+            logger.info(
+                f"Model loading kwargs {self._trust_remote_code or '{}'} for "
+                f"{self.script_args.model_id}"
+            )
+        return self._trust_remote_code
 
     @property
     def use_deepspeed(self) -> bool:
@@ -210,15 +328,15 @@ class ModelConfigBuilder:
                 "attn_implementation": self.script_args.attn_implementation,
                 "torch_dtype": self.torch_dtype,
                 "use_cache": False,  # GRPO requires use_cache=False
-                "trust_remote_code": True,
                 "cache_dir": "/tmp/.cache",
+                **self.trust_remote_code,
             }
         else:
             model_kwargs = {
                 "torch_dtype": self.torch_dtype,
                 "use_cache": False,  # GRPO requires use_cache=False
-                "trust_remote_code": True,
                 "cache_dir": "/tmp/.cache",
+                **self.trust_remote_code,
             }
 
         # Set low_cpu_mem_usage based on DeepSpeed usage
@@ -579,7 +697,10 @@ def load_model(
 def load_tokenizer(script_args: ScriptArguments) -> AutoTokenizer:
     """Load tokenizer."""
     try:
-        tokenizer = AutoTokenizer.from_pretrained(script_args.model_id)
+        tokenizer = AutoTokenizer.from_pretrained(
+            script_args.model_id,
+            **trust_remote_code_for(script_args),
+        )
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
         return tokenizer
@@ -713,16 +834,56 @@ def _coerce_tied_weights_keys(model):
     return model
 
 
+def _patch_peft_weight_converter_compat() -> None:
+    """Let `WeightConverter` tolerate the kwargs peft 0.19.x passes to it.
+
+    `peft.utils.transformers_weight_conversion.build_peft_weight_mapping` rebuilds a
+    model's weight converters with
+    `orig_conversion.__class__(..., distributed_operation=..., quantization_operation=...)`.
+    That matched the old dataclass `WeightConverter`, but transformers rewrote it with an
+    explicit `(source_patterns, target_patterns, operations)` signature - both fields are
+    now runtime state initialised to `None` by `WeightTransform.__init__`. Loading any
+    LoRA adapter for a model whose `model_type` has a registered conversion mapping (MoE
+    architectures that merge per-expert checkpoint weights into 3-D tensors, e.g.
+    `nemotron_h`) therefore raises `TypeError: WeightConverter.__init__() got an
+    unexpected keyword argument 'distributed_operation'`.
+
+    peft `main` fixes this by dropping both kwargs; peft 0.19.1 is the latest release and
+    still has the bug. Forwarding them after `__init__` is equivalent, since the values
+    are only populated during a tensor-parallel or quantized load. Remove this shim once
+    the requirements pin a peft release that contains the upstream fix.
+    """
+    from transformers.core_model_loading import WeightConverter
+
+    orig_init = WeightConverter.__init__
+    if getattr(orig_init, "_peft_compat", False):
+        return
+
+    def __init__(
+        self, *args, distributed_operation=None, quantization_operation=None, **kwargs
+    ):
+        orig_init(self, *args, **kwargs)
+        self.distributed_operation = distributed_operation
+        self.quantization_operation = quantization_operation
+
+    __init__._peft_compat = True
+    WeightConverter.__init__ = __init__
+
+
 def _merge_adapter_in_process(
-    temp_dir: str, final_output_dir: str, torch_dtype: torch.dtype = torch.bfloat16
+    temp_dir: str,
+    final_output_dir: str,
+    torch_dtype: torch.dtype = torch.bfloat16,
+    trc_kwargs: Optional[Dict[str, Any]] = None,
 ) -> AutoModelForCausalLM:
     """Merge LoRA adapter in the current process (for FSDP/DDP)."""
+    _patch_peft_weight_converter_compat()
     with gpu_memory_manager():
         model = AutoPeftModelForCausalLM.from_pretrained(
             temp_dir,
             torch_dtype=torch_dtype,
             low_cpu_mem_usage=True,
-            trust_remote_code=True,
+            **(trc_kwargs or {}),
         )
         model = model.merge_and_unload()
         _coerce_tied_weights_keys(model)
@@ -733,19 +894,44 @@ def _merge_adapter_in_process(
 
 
 def _merge_adapter_via_subprocess(
-    temp_dir: str, final_output_dir: str, torch_dtype_str: str = "bfloat16"
+    temp_dir: str,
+    final_output_dir: str,
+    torch_dtype_str: str = "bfloat16",
+    trc_kwargs: Optional[Dict[str, Any]] = None,
 ) -> None:
-    """Merge LoRA adapter in a clean subprocess to avoid DeepSpeed env conflicts."""
+    """Merge LoRA adapter in a clean subprocess to avoid DeepSpeed env conflicts.
+
+    `trc_kwargs` carries `trust_remote_code` only when it has to be passed; an
+    empty mapping lets Transformers resolve the implementation itself.
+    """
     merge_script = textwrap.dedent(f"""\
         import torch
         from peft import AutoPeftModelForCausalLM
+        from transformers.core_model_loading import WeightConverter
+
+        # peft 0.19.x passes distributed_operation / quantization_operation into
+        # WeightConverter.__init__, which the current signature does not accept
+        # (fixed on peft main). Both are runtime fields defaulting to None, so
+        # forwarding them post-init matches upstream. Without this, loading a LoRA
+        # adapter for a model whose model_type has a registered conversion mapping
+        # (MoE 3-D expert weights, e.g. nemotron_h) raises TypeError.
+        _orig_wc_init = WeightConverter.__init__
+        if not getattr(_orig_wc_init, "_peft_compat", False):
+            def _wc_init(self, *a, distributed_operation=None, quantization_operation=None, **kw):
+                _orig_wc_init(self, *a, **kw)
+                self.distributed_operation = distributed_operation
+                self.quantization_operation = quantization_operation
+            _wc_init._peft_compat = True
+            WeightConverter.__init__ = _wc_init
+
+        trc = {trc_kwargs or {}!r}
 
         print("Loading adapter for merging...")
         model = AutoPeftModelForCausalLM.from_pretrained(
             "{temp_dir}",
             torch_dtype=getattr(torch, "{torch_dtype_str}"),
             low_cpu_mem_usage=True,
-            trust_remote_code=True,
+            **trc,
         )
 
         print("Merging LoRA weights...")
@@ -834,7 +1020,10 @@ def save_model(
                     else "bfloat16"
                 )
                 _merge_adapter_via_subprocess(
-                    temp_dir, final_output_dir, torch_dtype_str=dtype_str
+                    temp_dir,
+                    final_output_dir,
+                    torch_dtype_str=dtype_str,
+                    trc_kwargs=trust_remote_code_for(script_args),
                 )
                 tokenizer.save_pretrained(final_output_dir)
                 if mlflow_enabled:
@@ -861,7 +1050,10 @@ def save_model(
                     else torch.bfloat16
                 )
                 merged_model = _merge_adapter_in_process(
-                    temp_dir, final_output_dir, torch_dtype=save_dtype
+                    temp_dir,
+                    final_output_dir,
+                    torch_dtype=save_dtype,
+                    trc_kwargs=trust_remote_code_for(script_args),
                 )
                 tokenizer.save_pretrained(final_output_dir)
                 if mlflow_enabled:
