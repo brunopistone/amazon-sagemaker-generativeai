@@ -25,6 +25,7 @@ from transformers import (
     AutoTokenizer,
     BitsAndBytesConfig,
     EarlyStoppingCallback,
+    GenerationConfig,
     Mxfp4Config,
     set_seed,
 )
@@ -194,20 +195,25 @@ class ScriptArguments:
     model_id: str = field(
         default=None, metadata={"help": "Model ID to use for DPO training"}
     )
-    token: str = field(default=None, metadata={"help": "Hugging Face API token"})
-    trust_remote_code: Optional[bool] = field(
+    vlm_base_model_id: Optional[str] = field(
         default=None,
         metadata={
             "help": (
-                "Execute the repository's custom modeling code. Leave unset to "
-                "auto-detect: the native Transformers implementation is preferred "
-                "whenever one exists, and custom code is only used for "
-                "architectures Transformers does not implement. Forcing true on a "
-                "natively supported model silently downgrades it to a stale "
-                "snapshot (breaks flash_attention_2/3 and sdpa)."
+                "Original full VLM used to restore vision weights when model_id or "
+                "the adapter base is a text-only intermediate checkpoint."
             )
         },
     )
+    token: str = field(default=None, metadata={"help": "Hugging Face API token"})
+    # NOTE: `trust_remote_code` deliberately does NOT live here. TRL 1.10.0 added
+    # the same field to its configs (DPOConfig/SFTConfig/GRPOConfig), and TrlParser
+    # builds one argparse namespace from both dataclasses, so defining it in both
+    # aborts at startup with:
+    #   argparse.ArgumentError: argument --trust_remote_code/--trust-remote-code:
+    #   conflicting option strings
+    # The YAML key still works - it binds to the trainer config instead - and
+    # `trust_remote_code_for()` reads the value back off `script_args` after
+    # `main()` copies it across. Same fix as `max_length` in the SFT script.
     train_dataset_path: Optional[str] = field(
         default=None, metadata={"help": "Path to the training dataset"}
     )
@@ -255,12 +261,26 @@ class ScriptArguments:
     )
 
 
-def trust_remote_code_for(script_args: ScriptArguments) -> Dict[str, Any]:
-    """`trust_remote_code` kwargs for the run's model: explicit config value wins."""
+def trust_remote_code_for(
+    script_args: ScriptArguments, training_args: Optional["DPOConfig"] = None
+) -> Dict[str, Any]:
+    """`trust_remote_code` kwargs for the run's model: explicit config value wins.
+
+    The flag lives on the trainer config rather than ScriptArguments, because TRL
+    1.10.0 defines it too and TrlParser rejects the duplicate (see the note in
+    ScriptArguments). TRL types it as a plain `bool` defaulting to False, so False
+    is indistinguishable from "not set": only an explicit true is honoured as an
+    override, and everything else falls through to auto-detection. That is the only
+    useful direction anyway - auto-detect already omits the argument when it is not
+    needed, which lets Transformers raise its own actionable "Please pass the
+    argument `trust_remote_code=True`" instead of failing opaquely.
+
+    `training_args` is optional so this stays callable from a test, or from another
+    module importing this script, without constructing a trainer config.
+    """
+    override = True if getattr(training_args, "trust_remote_code", False) else None
     return trust_remote_code_kwargs(
-        script_args.model_id,
-        script_args.token,
-        override=script_args.trust_remote_code,
+        script_args.model_id, script_args.token, override=override
     )
 
 
@@ -292,7 +312,9 @@ class ModelConfigBuilder:
     def trust_remote_code(self) -> Dict[str, Any]:
         """Resolve the `trust_remote_code` kwargs once per run (may be empty)."""
         if self._trust_remote_code is None:
-            self._trust_remote_code = trust_remote_code_for(self.script_args)
+            self._trust_remote_code = trust_remote_code_for(
+                self.script_args, self.training_args
+            )
             logger.info(
                 f"Model loading kwargs {self._trust_remote_code or '{}'} for "
                 f"{self.script_args.model_id}"
@@ -774,12 +796,14 @@ def load_model(
         raise
 
 
-def load_tokenizer(script_args: ScriptArguments) -> AutoTokenizer:
+def load_tokenizer(
+    script_args: ScriptArguments, training_args: "DPOConfig"
+) -> AutoTokenizer:
     """Load tokenizer."""
     try:
         tokenizer = AutoTokenizer.from_pretrained(
             script_args.model_id,
-            **trust_remote_code_for(script_args),
+            **trust_remote_code_for(script_args, training_args),
         )
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
@@ -789,12 +813,12 @@ def load_tokenizer(script_args: ScriptArguments) -> AutoTokenizer:
         raise
 
 
-def load_processor(script_args: ScriptArguments):
+def load_processor(script_args: ScriptArguments, training_args: "DPOConfig"):
     """Load processor for multimodal models. Returns None if unavailable."""
     try:
         processor = AutoProcessor.from_pretrained(
             script_args.model_id,
-            **trust_remote_code_for(script_args),
+            **trust_remote_code_for(script_args, training_args),
         )
         tokenizer = getattr(processor, "tokenizer", None)
         if tokenizer is not None and tokenizer.pad_token is None:
@@ -806,11 +830,40 @@ def load_processor(script_args: ScriptArguments):
         return None
 
 
-def extract_tools_from_dataset(dataset: Dataset) -> Optional[List[Dict]]:
-    """Extract tools from first sample if available."""
-    if "tools" in dataset.column_names and dataset[0]["tools"]:
-        return dataset[0]["tools"]
-    return None
+def extract_tools_from_dataset(
+    dataset: Dataset, sample_size: int = 512
+) -> Optional[List[Dict]]:
+    """Tools for the run, taken from the first sample that declares them.
+
+    ``DPOConfig.tools`` is ONE value for the whole run - it reaches the chat template as a
+    single ``tools=`` argument - so a dataset whose rows declare different tool sets cannot
+    be represented faithfully here. Row 0 still wins, because that is all the config can
+    carry, but a mismatch is now reported rather than applied in silence: a row rendered
+    with another row's tools teaches the model to call functions that were never offered
+    for that request.
+    """
+    if "tools" not in dataset.column_names:
+        return None
+
+    tools = dataset[0]["tools"]
+    if not tools:
+        return None
+
+    total = len(dataset)
+    limit = min(total, sample_size)
+    distinct = {
+        json.dumps(dataset[i]["tools"], sort_keys=True, default=str)
+        for i in range(limit)
+    }
+    if len(distinct) > 1:
+        logger.warning(
+            f"The `tools` column holds {len(distinct)} different tool sets in the first "
+            f"{limit} of {total} row(s), but DPOConfig.tools is a single run-wide value. "
+            "Row 0's tools will be used for EVERY row, so rows declaring a different set "
+            "are rendered with tools they never had. Split the dataset per tool set, or "
+            "carry the schemas in each row's prompt text instead."
+        )
+    return tools
 
 
 def _was_trained_as_vlm(adapter_dir: str) -> bool:
@@ -852,9 +905,9 @@ def _was_trained_as_vlm(adapter_dir: str) -> bool:
     return False
 
 
-def _is_vlm_from_config(model_id: str) -> bool:
+def _is_vlm_from_config(model_id: Optional[str]) -> bool:
     """Check if a model is a VLM by inspecting its config."""
-    if AutoModelForImageTextToText is None:
+    if not model_id or AutoModelForImageTextToText is None:
         return False
     try:
         from transformers import AutoConfig
@@ -866,8 +919,26 @@ def _is_vlm_from_config(model_id: str) -> bool:
             model_id, **trust_remote_code_kwargs(model_id)
         )
         return config.model_type in MODEL_FOR_IMAGE_TEXT_TO_TEXT_MAPPING_NAMES
-    except Exception:
+    except Exception as e:
+        logger.warning(f"Could not inspect VLM config for {model_id}: {e}")
         return False
+
+
+def _resolve_vlm_base_model_id(
+    adapter_base_model_id: Optional[str],
+    explicit_vlm_base_model_id: Optional[str],
+) -> Optional[str]:
+    """Resolve the complete VLM used to preserve vision weights during export."""
+    if explicit_vlm_base_model_id:
+        if not _is_vlm_from_config(explicit_vlm_base_model_id):
+            raise ValueError(
+                "vlm_base_model_id must reference a full supported VLM, got: "
+                f"{explicit_vlm_base_model_id}"
+            )
+        return explicit_vlm_base_model_id
+    if _is_vlm_from_config(adapter_base_model_id):
+        return adapter_base_model_id
+    return None
 
 
 def _transplant_into_vlm(
@@ -895,33 +966,52 @@ def _transplant_into_vlm(
 
     causal_layer_key = next((k for k in merged_causal_state if ".layers.0." in k), None)
     if causal_layer_key is None:
-        logger.warning(
-            "Could not find layer keys in merged state dict, skipping transplant"
+        raise RuntimeError(
+            "Could not find layer keys in merged state dict; VLM export aborted"
         )
-        return vlm_model
 
     causal_prefix = causal_layer_key.split("layers.0.")[0]
     vlm_layer_key = next(
         (k for k in vlm_state if ".layers.0." in k and "language_model" in k), None
     )
     if vlm_layer_key is None:
-        logger.warning(
-            "Could not find language_model layer keys in VLM, skipping transplant"
+        raise RuntimeError(
+            "Could not find language_model layer keys in VLM; export aborted"
         )
-        return vlm_model
 
     vlm_prefix = vlm_layer_key.split("layers.0.")[0]
     logger.info(f"Key mapping: CausalLM '{causal_prefix}*' -> VLM '{vlm_prefix}*'")
 
     updated = 0
+    updated_core = 0
+    missing_core = []
     for causal_key, value in merged_causal_state.items():
-        if causal_key.startswith(causal_prefix):
+        is_core = causal_key.startswith(causal_prefix)
+        if is_core:
             vlm_key = vlm_prefix + causal_key[len(causal_prefix) :]
+        elif causal_key in vlm_state:
+            vlm_key = causal_key
         else:
             vlm_key = next((vk for vk in vlm_state if vk.endswith(causal_key)), None)
         if vlm_key and vlm_key in vlm_state:
+            if tuple(vlm_state[vlm_key].shape) != tuple(value.shape):
+                raise RuntimeError(
+                    f"Shape mismatch during VLM transplant: {causal_key} -> "
+                    f"{vlm_key}: {tuple(value.shape)} != "
+                    f"{tuple(vlm_state[vlm_key].shape)}"
+                )
             vlm_state[vlm_key] = value
             updated += 1
+            updated_core += int(is_core)
+        elif is_core:
+            missing_core.append(causal_key)
+
+    if updated_core == 0 or missing_core:
+        raise RuntimeError(
+            "Incomplete CausalLM-to-VLM transplant: "
+            f"{updated_core} core tensors updated, {len(missing_core)} missing "
+            f"(examples: {missing_core[:3]})"
+        )
 
     logger.info(
         f"Transplanted {updated}/{len(merged_causal_state)} language model weights into VLM"
@@ -966,7 +1056,11 @@ def _patch_peft_weight_converter_compat() -> None:
     WeightConverter.__init__ = __init__
 
 
-def _load_and_merge_adapter(adapter_dir: str, torch_dtype: torch.dtype):
+def _load_and_merge_adapter(
+    adapter_dir: str,
+    torch_dtype: torch.dtype,
+    explicit_vlm_base_model_id: Optional[str] = None,
+):
     """Load, merge, and return the final model ready for saving.
 
     Handles three cases:
@@ -981,18 +1075,24 @@ def _load_and_merge_adapter(adapter_dir: str, torch_dtype: torch.dtype):
     peft_config = PeftConfig.from_pretrained(adapter_dir)
     base_model_id = peft_config.base_model_name_or_path
     trained_as_vlm = _was_trained_as_vlm(adapter_dir)
-    base_is_vlm = _is_vlm_from_config(base_model_id)
+    vlm_base_model_id = _resolve_vlm_base_model_id(
+        base_model_id, explicit_vlm_base_model_id
+    )
     trc_kwargs = trust_remote_code_kwargs(base_model_id)
 
     if trained_as_vlm:
+        if not vlm_base_model_id:
+            raise RuntimeError(
+                "Adapter keys indicate VLM training but no complete VLM base was found"
+            )
         logger.info(
             f"Adapter trained on VLM: loading with {AutoModelForImageTextToText.__name__}"
         )
         base_model = AutoModelForImageTextToText.from_pretrained(
-            base_model_id,
+            vlm_base_model_id,
             torch_dtype=torch_dtype,
             low_cpu_mem_usage=True,
-            **trc_kwargs,
+            **trust_remote_code_kwargs(vlm_base_model_id),
         )
         model = PeftModel.from_pretrained(base_model, adapter_dir)
         return model.merge_and_unload()
@@ -1006,13 +1106,118 @@ def _load_and_merge_adapter(adapter_dir: str, torch_dtype: torch.dtype):
     )
     merged_causal = causal_model.merge_and_unload()
 
-    if base_is_vlm:
+    if vlm_base_model_id:
         merged_state = merged_causal.state_dict()
         del causal_model, merged_causal
         torch.cuda.empty_cache()
-        return _transplant_into_vlm(merged_state, base_model_id, torch_dtype)
+        return _transplant_into_vlm(merged_state, vlm_base_model_id, torch_dtype)
 
     return merged_causal
+
+
+def _sanitize_sampling_params(generation_config) -> bool:
+    """Reset sampling-only parameters left set while `do_sample` is not True.
+
+    transformers >= 5 validates strictly inside ``GenerationConfig.save_pretrained``
+    (``self.validate(strict=True)``, with no kwarg to relax it) and raises when a
+    sampling-only parameter differs from its default while ``do_sample`` is not True.
+    NVIDIA Nemotron-3-Nano ships ``{"temperature": 1.0, "top_p": 0.95}`` with no
+    ``do_sample``, so saving a merged checkpoint dies with::
+
+        ValueError: GenerationConfig is invalid:
+        - `top_p`: `do_sample` is not set to `True`. However, `top_p` is set to `0.95` ...
+
+    The error names both resolutions: set ``do_sample=True``, or unset the parameter. We
+    unset, i.e. resolve toward greedy decoding, because a model fine-tuned to emit strict
+    JSON should not sample by default - an unparameterised ``generate()`` on the exported
+    checkpoint would otherwise produce temperature-1.0 top-p-0.95 output and malformed
+    JSON. Callers that do want sampling still pass it per request, which is how both the
+    endpoint and the Bedrock baseline in the evaluation notebook already work.
+
+    Defaults are transformers' own (`temperature`/`top_p`/`typical_p` 1.0, `top_k` 50,
+    `epsilon_cutoff`/`eta_cutoff` 0.0, `min_p`/`top_h` None). Returns True if anything
+    changed.
+    """
+    if getattr(generation_config, "do_sample", None) is True:
+        return False
+
+    sampling_defaults = {
+        "temperature": 1.0,
+        "top_p": 1.0,
+        "typical_p": 1.0,
+        "top_k": 50,
+        "epsilon_cutoff": 0.0,
+        "eta_cutoff": 0.0,
+        "min_p": None,
+        "top_h": None,
+    }
+
+    changed = False
+    for attr, default in sampling_defaults.items():
+        if not hasattr(generation_config, attr):
+            continue
+        current = getattr(generation_config, attr)
+        if current is not None and current != default:
+            logger.info(
+                f"generation_config.{attr}: {current} -> {default} "
+                "(sampling parameter set without do_sample=True; transformers refuses "
+                "to save it)"
+            )
+            setattr(generation_config, attr, default)
+            changed = True
+    return changed
+
+
+def _align_generation_config(tokenizer: AutoTokenizer, final_output_dir: str) -> None:
+    """Point the exported generation_config at the tokenizer's eos/pad tokens.
+
+    Runs on the saved directory rather than on the in-memory model because both merge
+    paths reload the base model from the hub (`_merge_adapter_in_process` after the
+    trainer has been deleted, `_merge_adapter_via_subprocess` in another process), so
+    whatever `generation_config.json` they write comes from the base repo.
+
+    Some repos declare an eos_token_id their chat template never emits (NVIDIA
+    Nemotron-H declares `2` / `</s>` while its template ends turns with `<|im_end|>`).
+    Left unaligned that ships into serving and the model generates past the end of its
+    answer looking for a token it cannot produce.
+    """
+    if not os.path.exists(os.path.join(final_output_dir, "generation_config.json")):
+        # Adapter-only exports have no generation_config; the base repo's applies.
+        return
+
+    generation_config = GenerationConfig.from_pretrained(final_output_dir)
+    # The re-save below validates strictly too, so a base repo whose sampling params are
+    # set without do_sample would abort here even when the merge itself succeeded.
+    changed = _sanitize_sampling_params(generation_config)
+    for attr, token_id in (
+        ("eos_token_id", tokenizer.eos_token_id),
+        ("pad_token_id", tokenizer.pad_token_id),
+    ):
+        current = getattr(generation_config, attr, None)
+        if token_id is None:
+            continue
+        if isinstance(current, (list, tuple)):
+            # `eos_token_id` may legitimately hold several stop tokens (Nemotron-3-Nano
+            # 30B ships [2, 11] = </s> and <|im_end|>). Replacing the list with the
+            # tokenizer's single id would drop the others, so add instead - dropping the
+            # template's real turn terminator is the very failure this guards against.
+            if token_id not in current:
+                logger.info(
+                    f"generation_config.{attr}: {list(current)} + [{token_id}] "
+                    f"(tokenizer's token was missing from the list)"
+                )
+                setattr(generation_config, attr, list(current) + [token_id])
+                changed = True
+        elif current != token_id:
+            logger.info(
+                f"generation_config.{attr}: {current} -> {token_id} "
+                f"(matching the tokenizer)"
+            )
+            setattr(generation_config, attr, token_id)
+            changed = True
+
+    if changed:
+        generation_config.save_pretrained(final_output_dir)
 
 
 def _coerce_tied_weights_keys(model):
@@ -1040,11 +1245,21 @@ def _merge_adapter_in_process(
     temp_dir: str,
     final_output_dir: str,
     torch_dtype: torch.dtype = torch.bfloat16,
+    vlm_base_model_id: Optional[str] = None,
 ):
     """Merge LoRA adapter in the current process (for FSDP/DDP)."""
     with gpu_memory_manager():
-        model = _load_and_merge_adapter(temp_dir, torch_dtype)
+        model = _load_and_merge_adapter(
+            temp_dir,
+            torch_dtype,
+            explicit_vlm_base_model_id=vlm_base_model_id,
+        )
         _coerce_tied_weights_keys(model)
+        # Must run before save_pretrained: it writes generation_config.json, and
+        # transformers validates it strictly there. The base repo's sampling params would
+        # abort the save after training has already succeeded.
+        if getattr(model, "generation_config", None) is not None:
+            _sanitize_sampling_params(model.generation_config)
         model.save_pretrained(
             final_output_dir, safe_serialization=True, max_shard_size="2GB"
         )
@@ -1055,6 +1270,7 @@ def _merge_adapter_via_subprocess(
     temp_dir: str,
     final_output_dir: str,
     torch_dtype_str: str = "bfloat16",
+    vlm_base_model_id: Optional[str] = None,
     trc_kwargs: Optional[Dict[str, Any]] = None,
 ) -> None:
     """Merge LoRA adapter in a clean subprocess to avoid DeepSpeed env conflicts.
@@ -1091,6 +1307,7 @@ def _merge_adapter_via_subprocess(
         output_dir = "{final_output_dir}"
         dtype = getattr(torch, "{torch_dtype_str}")
         trc = {trc_kwargs or {}!r}
+        explicit_vlm_base_model_id = {vlm_base_model_id!r}
 
         peft_config = PeftConfig.from_pretrained(adapter_dir)
         base_model_id = peft_config.base_model_name_or_path
@@ -1119,6 +1336,22 @@ def _merge_adapter_via_subprocess(
             base_is_vlm = config.model_type in MODEL_FOR_IMAGE_TEXT_TO_TEXT_MAPPING_NAMES
         except Exception:
             pass
+        if explicit_vlm_base_model_id:
+            try:
+                config = AutoConfig.from_pretrained(explicit_vlm_base_model_id, **trc)
+                if config.model_type not in MODEL_FOR_IMAGE_TEXT_TO_TEXT_MAPPING_NAMES:
+                    raise ValueError(
+                        f"Not an image-text model type: {{config.model_type}}"
+                    )
+            except Exception as e:
+                raise ValueError(
+                    f"Invalid vlm_base_model_id {{explicit_vlm_base_model_id}}: {{e}}"
+                ) from e
+            full_vlm_base_model_id = explicit_vlm_base_model_id
+        elif base_is_vlm:
+            full_vlm_base_model_id = base_model_id
+        else:
+            full_vlm_base_model_id = None
 
         try:
             from transformers import AutoModelForImageTextToText
@@ -1129,11 +1362,21 @@ def _merge_adapter_via_subprocess(
             except ImportError:
                 vlm_auto_cls = None
 
+        if full_vlm_base_model_id and vlm_auto_cls is None:
+            raise RuntimeError(
+                "A VLM export was requested but this Transformers version has no "
+                "image-text auto model class"
+            )
+
         if trained_as_vlm and vlm_auto_cls:
+            if not full_vlm_base_model_id:
+                raise RuntimeError(
+                    "Adapter was trained as a VLM but no complete VLM base was found"
+                )
             # Case 1: adapter trained on VLM -> merge directly
             print(f"Adapter trained on VLM: loading with {{vlm_auto_cls.__name__}}")
             base_model = vlm_auto_cls.from_pretrained(
-                base_model_id, torch_dtype=dtype,
+                full_vlm_base_model_id, torch_dtype=dtype,
                 low_cpu_mem_usage=True, **trc,
             )
             model = PeftModel.from_pretrained(base_model, adapter_dir)
@@ -1147,7 +1390,7 @@ def _merge_adapter_via_subprocess(
             )
             model = causal_model.merge_and_unload()
 
-            if base_is_vlm and vlm_auto_cls:
+            if full_vlm_base_model_id and vlm_auto_cls:
                 # Case 2: CausalLM adapter on VLM base -> transplant into full VLM
                 print("Base is VLM: transplanting merged weights into full VLM...")
                 merged_state = model.state_dict()
@@ -1155,7 +1398,7 @@ def _merge_adapter_via_subprocess(
                 torch.cuda.empty_cache()
 
                 vlm_model = vlm_auto_cls.from_pretrained(
-                    base_model_id, torch_dtype=dtype,
+                    full_vlm_base_model_id, torch_dtype=dtype,
                     low_cpu_mem_usage=True, **trc,
                 )
                 vlm_state = vlm_model.state_dict()
@@ -1163,21 +1406,39 @@ def _merge_adapter_via_subprocess(
                 # Find key prefix mapping: CausalLM "model." -> VLM "model.language_model."
                 causal_lk = next((k for k in merged_state if ".layers.0." in k), None)
                 vlm_lk = next((k for k in vlm_state if ".layers.0." in k and "language_model" in k), None)
-                if causal_lk and vlm_lk:
-                    c_prefix = causal_lk.split("layers.0.")[0]
-                    v_prefix = vlm_lk.split("layers.0.")[0]
-                    print(f"Key mapping: '{{c_prefix}}*' -> '{{v_prefix}}*'")
-                    updated = 0
-                    for ck, val in merged_state.items():
-                        if ck.startswith(c_prefix):
-                            vk = v_prefix + ck[len(c_prefix):]
-                        else:
-                            vk = next((x for x in vlm_state if x.endswith(ck)), None)
-                        if vk and vk in vlm_state:
-                            vlm_state[vk] = val
-                            updated += 1
-                    print(f"Transplanted {{updated}}/{{len(merged_state)}} weights")
-                    vlm_model.load_state_dict(vlm_state)
+                if not causal_lk or not vlm_lk:
+                    raise RuntimeError(
+                        "Cannot determine CausalLM-to-VLM key prefixes; export aborted"
+                    )
+                c_prefix = causal_lk.split("layers.0.")[0]
+                v_prefix = vlm_lk.split("layers.0.")[0]
+                print(f"Key mapping: '{{c_prefix}}*' -> '{{v_prefix}}*'")
+                updated = 0
+                updated_core = 0
+                missing_core = []
+                for ck, val in merged_state.items():
+                    is_core = ck.startswith(c_prefix)
+                    if is_core:
+                        vk = v_prefix + ck[len(c_prefix):]
+                    elif ck in vlm_state:
+                        vk = ck
+                    else:
+                        vk = next((x for x in vlm_state if x.endswith(ck)), None)
+                    if vk and vk in vlm_state:
+                        if tuple(vlm_state[vk].shape) != tuple(val.shape):
+                            raise RuntimeError(f"Shape mismatch: {{ck}} -> {{vk}}")
+                        vlm_state[vk] = val
+                        updated += 1
+                        updated_core += int(is_core)
+                    elif is_core:
+                        missing_core.append(ck)
+                if updated_core == 0 or missing_core:
+                    raise RuntimeError(
+                        f"Incomplete VLM transplant: {{updated_core}} core tensors "
+                        f"updated, {{len(missing_core)}} missing"
+                    )
+                print(f"Transplanted {{updated}}/{{len(merged_state)}} weights")
+                vlm_model.load_state_dict(vlm_state)
                 model = vlm_model
 
         print("Saving merged model...")
@@ -1187,6 +1448,24 @@ def _merge_adapter_via_subprocess(
             _tied = getattr(_m, "_tied_weights_keys", None)
             if isinstance(_tied, (list, tuple, set)):
                 _m._tied_weights_keys = {{k: k for k in _tied}}
+
+        # transformers >=5 validates generation_config strictly inside save_pretrained and
+        # raises when a sampling-only param is set while do_sample is not True (NVIDIA
+        # Nemotron-3-Nano 4B ships top_p=0.95 with no do_sample). Reset to the defaults,
+        # i.e. greedy - see _sanitize_sampling_params above for why that direction.
+        _gc = getattr(model, "generation_config", None)
+        if _gc is not None and getattr(_gc, "do_sample", None) is not True:
+            for _attr, _default in (
+                ("temperature", 1.0), ("top_p", 1.0), ("typical_p", 1.0),
+                ("top_k", 50), ("epsilon_cutoff", 0.0), ("eta_cutoff", 0.0),
+                ("min_p", None), ("top_h", None),
+            ):
+                if hasattr(_gc, _attr):
+                    _cur = getattr(_gc, _attr)
+                    if _cur is not None and _cur != _default:
+                        print(f"generation_config.{{_attr}}: {{_cur}} -> {{_default}}")
+                        setattr(_gc, _attr, _default)
+
         model.save_pretrained(
             output_dir,
             safe_serialization=True,
@@ -1229,6 +1508,7 @@ def _save_artifacts_on_main(
     from the base model so the output is complete for multi-modal inference.
     """
     tokenizer.save_pretrained(final_output_dir)
+    _align_generation_config(tokenizer, final_output_dir)
     if processor is not None:
         processor.save_pretrained(final_output_dir)
         if (
@@ -1264,7 +1544,81 @@ def _save_artifacts_on_main(
             ):
                 base_processor.video_processor.save_pretrained(final_output_dir)
         except Exception as e:
-            logger.warning(f"Could not auto-save processor for VLM: {e}")
+            raise RuntimeError(
+                f"Could not auto-save processor for VLM {model_id}: {e}"
+            ) from e
+
+
+def _is_visual_weight_key(key: str) -> bool:
+    return (
+        key.startswith(("visual.", "vision_model.", "vision_tower."))
+        or ".visual." in key
+        or ".vision_model." in key
+        or ".vision_tower." in key
+    )
+
+
+def _validate_vlm_export(final_output_dir: str) -> None:
+    """Fail unless an exported directory is a complete standalone VLM."""
+    config_path = os.path.join(final_output_dir, "config.json")
+    if not os.path.isfile(config_path):
+        raise RuntimeError("VLM export is missing config.json")
+    with open(config_path, encoding="utf-8") as config_file:
+        config = json.load(config_file)
+    if not isinstance(config.get("vision_config"), dict):
+        raise RuntimeError("VLM export config.json has no vision_config")
+    if str(config.get("model_type", "")).endswith("_text"):
+        raise RuntimeError("VLM export has a text-only model_type")
+
+    index_path = os.path.join(final_output_dir, "model.safetensors.index.json")
+    weight_keys = []
+    if os.path.isfile(index_path):
+        with open(index_path, encoding="utf-8") as index_file:
+            weight_map = json.load(index_file).get("weight_map", {})
+        weight_keys = list(weight_map)
+        missing_shards = sorted(
+            {
+                filename
+                for filename in weight_map.values()
+                if not os.path.isfile(os.path.join(final_output_dir, filename))
+            }
+        )
+        if missing_shards:
+            raise RuntimeError(
+                f"VLM export references missing shards: {missing_shards}"
+            )
+    else:
+        import glob
+        from safetensors import safe_open
+
+        shard_paths = glob.glob(os.path.join(final_output_dir, "*.safetensors"))
+        if not shard_paths:
+            raise RuntimeError("VLM export contains no safetensors weights")
+        for shard_path in shard_paths:
+            with safe_open(shard_path, framework="pt") as shard:
+                weight_keys.extend(shard.keys())
+
+    visual_count = sum(_is_visual_weight_key(key) for key in weight_keys)
+    if visual_count == 0:
+        raise RuntimeError("VLM export contains no visual/vision weight tensors")
+    required_processor_files = ["preprocessor_config.json"]
+    if config.get("model_type") == "qwen3_5":
+        required_processor_files.append("video_preprocessor_config.json")
+    missing_processor_files = [
+        filename
+        for filename in required_processor_files
+        if not os.path.isfile(os.path.join(final_output_dir, filename))
+    ]
+    if missing_processor_files:
+        raise RuntimeError(
+            "VLM export is missing required processor files: "
+            f"{missing_processor_files}"
+        )
+    logger.info(
+        "Validated standalone VLM export: %d tensors, %d visual tensors",
+        len(weight_keys),
+        visual_count,
+    )
 
 
 def _detect_distributed_strategy(trainer: DPOTrainer) -> Tuple[bool, bool]:
@@ -1283,12 +1637,16 @@ def save_model(
     tokenizer: AutoTokenizer,
     processor,
     script_args: ScriptArguments,
+    training_args: "DPOConfig",
     accelerator: Accelerator,
     mlflow_enabled: bool,
     final_output_dir: str,
 ) -> None:
     """Save the trained model with proper DeepSpeed ZeRO-3 handling and online merging."""
     logger.info("STARTING MODEL SAVE PROCESS")
+    vlm_source_model_id = _resolve_vlm_base_model_id(
+        script_args.model_id, script_args.vlm_base_model_id
+    )
 
     accelerator.wait_for_everyone()
 
@@ -1318,11 +1676,14 @@ def save_model(
                     temp_dir,
                     final_output_dir,
                     torch_dtype_str=dtype_str,
-                    trc_kwargs=trust_remote_code_for(script_args),
+                    vlm_base_model_id=script_args.vlm_base_model_id,
+                    trc_kwargs=trust_remote_code_for(script_args, training_args),
                 )
                 _save_artifacts_on_main(
-                    tokenizer, processor, final_output_dir, script_args.model_id
+                    tokenizer, processor, final_output_dir, vlm_source_model_id
                 )
+                if vlm_source_model_id:
+                    _validate_vlm_export(final_output_dir)
                 if mlflow_enabled:
                     logger.info(
                         "Skipping MLflow registration (model merged in subprocess)"
@@ -1350,10 +1711,13 @@ def save_model(
                     temp_dir,
                     final_output_dir,
                     torch_dtype=save_dtype,
+                    vlm_base_model_id=script_args.vlm_base_model_id,
                 )
                 _save_artifacts_on_main(
-                    tokenizer, processor, final_output_dir, script_args.model_id
+                    tokenizer, processor, final_output_dir, vlm_source_model_id
                 )
+                if vlm_source_model_id:
+                    _validate_vlm_export(final_output_dir)
                 if mlflow_enabled:
                     register_model_in_mlflow(merged_model, tokenizer, script_args)
 
@@ -1361,13 +1725,21 @@ def save_model(
 
     else:
         # Covers both PEFT without merge and non-PEFT models
+        # A full (non-adapter) save writes generation_config.json, which transformers
+        # validates strictly - so sanitize before the save, not in the
+        # _align_generation_config that only runs afterwards.
+        generation_config = getattr(trainer.model, "generation_config", None)
+        if generation_config is not None:
+            _sanitize_sampling_params(generation_config)
         trainer.save_model(final_output_dir)
         accelerator.wait_for_everyone()
 
         if accelerator.is_main_process:
             _save_artifacts_on_main(
-                tokenizer, processor, final_output_dir, script_args.model_id
+                tokenizer, processor, final_output_dir, vlm_source_model_id
             )
+            if not script_args.use_peft and vlm_source_model_id:
+                _validate_vlm_export(final_output_dir)
             if mlflow_enabled:
                 register_model_in_mlflow(trainer.model, tokenizer, script_args)
 
@@ -1623,15 +1995,22 @@ def train(script_args, training_args, train_ds, test_ds):
             dist.barrier()
         script_args.model_id = "/tmp/tmp_folder"
 
+    if script_args.vlm_base_model_id:
+        _resolve_vlm_base_model_id(script_args.model_id, script_args.vlm_base_model_id)
+        logger.info(
+            "Validated explicit VLM export base: %s",
+            script_args.vlm_base_model_id,
+        )
+
     # Load model, tokenizer, and processor using centralized config
     # Processor is loaded for any VLM (auto-detected), not just when modality_type is "image".
     # modality_type controls the data pipeline; VLM detection controls model loading/merging.
     model = load_model(config_builder, script_args)
-    tokenizer = load_tokenizer(script_args)
+    tokenizer = load_tokenizer(script_args, training_args)
     is_vlm = script_args.modality_type == "image"
     processor = None
     if is_vlm:
-        processor = load_processor(script_args)
+        processor = load_processor(script_args, training_args)
         if processor is not None:
             logger.info(
                 "Multi-modal mode: using processor as processing_class for DPOTrainer"
@@ -1641,11 +2020,18 @@ def train(script_args, training_args, train_ds, test_ds):
     # requested and not set explicitly. Skipped for image modality, where sequences
     # include image tokens the tokenizer cannot measure here and max_length is forced
     # to None below anyway.
-    if (
-        script_args.auto_calculate_lengths
-        and not is_vlm
-        and getattr(training_args, "max_length", None) is None
-    ):
+    #
+    # The "not set explicitly" test compares against the DPOConfig default rather than
+    # None: `max_length` defaults to 1024, never None, so a `... is None` guard here is
+    # dead code - auto_calculate_lengths silently did nothing and every run trained at
+    # 1024 tokens, truncating from the right and cutting the completion off multi-turn
+    # samples. Mirrors the same check in sft/train.py.
+    default_max_length = 1024  # DPOConfig.max_length default
+    max_length_is_default = getattr(training_args, "max_length", None) in (
+        None,
+        default_max_length,
+    )
+    if script_args.auto_calculate_lengths and not is_vlm and max_length_is_default:
         logger.info("Auto-calculating optimal DPO max_length from dataset...")
         computed_max_length = calculate_optimal_dpo_lengths(
             tokenizer, train_ds, deserialize_messages=script_args.deserialize_messages
@@ -1653,6 +2039,13 @@ def train(script_args, training_args, train_ds, test_ds):
         if computed_max_length is not None:
             training_args.max_length = computed_max_length
             logger.info(f"Set max_length={computed_max_length}")
+    elif script_args.auto_calculate_lengths and not is_vlm:
+        # Explicit value wins, but say so: silence here is what made the dead guard
+        # above so hard to spot from the logs.
+        logger.info(
+            f"auto_calculate_lengths requested but max_length={training_args.max_length} "
+            "was set explicitly; keeping the explicit value."
+        )
 
     # Extract tools from dataset if available
     tools = extract_tools_from_dataset(train_ds)
@@ -1783,6 +2176,7 @@ def train(script_args, training_args, train_ds, test_ds):
         tokenizer,
         processor,
         script_args,
+        training_args,
         trainer.accelerator,
         mlflow_enabled,
         original_output_dir,
